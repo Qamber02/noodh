@@ -305,6 +305,7 @@ class Scanner(VideoTransformerBase):
         self.last_data = None
         self.last_when = None
         self.ok = False
+        self._last_scan_time = datetime.utcnow()
 
     def transform(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -316,17 +317,19 @@ class Scanner(VideoTransformerBase):
         x2, y2 = x1 + box, y1 + box
         roi = img[y1:y2, x1:x2]
 
-        # detect barcodes (EAN, Code128, QR, etc.)
-        barcodes = pyzbar.decode(roi)
-        self.ok = bool(barcodes)
-        if self.ok:
-            self.last_data = barcodes[0].data.decode("utf-8")
-            self.last_when = datetime.utcnow()
+        # throttle decoding to every 0.5s for optimization
+        now = datetime.utcnow()
+        if (now - self._last_scan_time).total_seconds() >= 0.5:
+            barcodes = pyzbar.decode(roi)
+            self.ok = bool(barcodes)
+            if self.ok:
+                self.last_data = barcodes[0].data.decode("utf-8")
+                self.last_when = now
+            self._last_scan_time = now
 
         # border color
         color = (0, 200, 0) if self.ok else (0, 0, 200)
-        thickness = 3
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
 
         # corner accents
         L = int(box * 0.12)
@@ -338,7 +341,8 @@ class Scanner(VideoTransformerBase):
         label = "Detected" if self.ok else "Align barcode in the box"
         cv2.putText(img, label, (x1, max(30, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-        # draw bounding boxes for detected barcodes
+        # draw bounding box around barcodes
+        barcodes = pyzbar.decode(roi)
         for bc in barcodes:
             pts = bc.polygon
             if pts and len(pts) > 1:
@@ -525,23 +529,11 @@ def view_products():
         st.info("No products yet.")
 
 
-def view_sales():
-    st.subheader("💰 Sales (Scan or search)")
-    webrtc_ctx = webrtc_streamer(
-        key="scanner",
-        mode=WebRtcMode.SENDRECV,
-        video_transformer_factory=Scanner,
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        media_stream_constraints={"video": {"facingMode": {"exact": "environment"}}, "audio": False},
-        async_transform=True,
-        desired_playing_state=True,
-    )
-    st.caption("Tip: Align the code inside the box. Border turns green when detected.")
-
+    # get scanned or manual input
     scanned = None
     if webrtc_ctx and webrtc_ctx.video_transformer:
         vt = webrtc_ctx.video_transformer
-        if vt.last_data and vt.last_when and datetime.utcnow() - vt.last_when <= timedelta(seconds=2.0):
+        if vt.last_data and vt.last_when and datetime.utcnow() - vt.last_when <= timedelta(seconds=3.0):
             scanned = vt.last_data
 
     c1, c2 = st.columns([2, 3])
@@ -553,21 +545,24 @@ def view_sales():
             st.info("Waiting for scan…")
 
     with c2:
-        manual = st.text_input("Or enter barcode/QR manually", placeholder="Type or paste code…")
+        manual = st.text_input("Or enter barcode manually", placeholder="Type or paste code…")
 
+    # priority: scanned > manual
     code_to_use = scanned or (manual.strip() if manual else None)
+
     if code_to_use:
         prod = get_product_by_barcode(code_to_use)
         if prod:
             pid, pname, price, stock = prod
             st.markdown(f"**Product:** {pname} · **Price:** {price:.2f} PKR · **Stock:** {stock}")
-            qty = st.number_input("Quantity", min_value=1, max_value=max(1, int(stock)), step=1)
-            if st.button("Confirm Sale"):
+            qty = st.number_input("Quantity", min_value=1, max_value=max(1, int(stock)), step=1, key=f"qty_{pid}")
+            if st.button("Confirm Sale", key=f"sale_{pid}"):
                 ok, info = log_sale(pid, int(qty), st.session_state.user_id)
                 if ok:
                     name, q, unit, total = info
                     st.success(f"Sale logged — total {total:.2f} PKR")
                     st.info(f"🧾 Receipt: {name} × {q} @ {unit:.2f} = {total:.2f} PKR")
+                    st.rerun()
                 else:
                     st.error(info)
         else:
