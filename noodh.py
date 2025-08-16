@@ -329,7 +329,7 @@ class BarcodeScanner(VideoTransformerBase):
         try:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             barcodes = pyzbar.decode(gray)
-        except Exception as e:
+        except Exception:
             barcodes = []
 
         for barcode in barcodes:
@@ -344,7 +344,6 @@ class BarcodeScanner(VideoTransformerBase):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
         return img
-
 
 # ---------------------- UI: Auth / Bootstrap ----------------------
 def bootstrap_admin_if_empty():
