@@ -4,7 +4,7 @@ import sqlite3
 import secrets
 import hashlib
 from datetime import datetime, timedelta
-
+from pyzbar import pyzbar
 import cv2
 import numpy as np
 import pandas as pd
@@ -302,7 +302,6 @@ def get_sales_df(start=None, end=None, product_id=None) -> pd.DataFrame:
 # ---------------------- SCANNER (VideoTransformerBase) ----------------------
 class Scanner(VideoTransformerBase):
     def __init__(self):
-        self.detector = cv2.QRCodeDetector()
         self.last_data = None
         self.last_when = None
         self.ok = False
@@ -317,10 +316,11 @@ class Scanner(VideoTransformerBase):
         x2, y2 = x1 + box, y1 + box
         roi = img[y1:y2, x1:x2]
 
-        data, bbox, _ = self.detector.detectAndDecode(roi)
-        self.ok = bool(data)
-        if data:
-            self.last_data = data
+        # detect barcodes (EAN, Code128, QR, etc.)
+        barcodes = pyzbar.decode(roi)
+        self.ok = bool(barcodes)
+        if self.ok:
+            self.last_data = barcodes[0].data.decode("utf-8")
             self.last_when = datetime.utcnow()
 
         # border color
@@ -335,19 +335,17 @@ class Scanner(VideoTransformerBase):
             cv2.line(img, (xa, ya), (xa, ya + (L if ya == y1 else -L)), color, 4)
 
         # label
-        label = "Detected" if self.ok else "Align code in the box"
+        label = "Detected" if self.ok else "Align barcode in the box"
         cv2.putText(img, label, (x1, max(30, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-        # draw bbox if available
-        if self.ok and bbox is not None:
-            pts = np.int32(bbox).reshape(-1, 2)
-            for j in range(len(pts)):
-                p1 = (x1 + pts[j][0], y1 + pts[j][1])
-                p2 = (x1 + pts[(j + 1) % len(pts)][0], y1 + pts[(j + 1) % len(pts)][1])
-                cv2.line(img, p1, p2, (0, 200, 0), 2)
+        # draw bounding boxes for detected barcodes
+        for bc in barcodes:
+            pts = bc.polygon
+            if pts and len(pts) > 1:
+                pts = np.array([(p.x + x1, p.y + y1) for p in pts], dtype=np.int32)
+                cv2.polylines(img, [pts], isClosed=True, color=(0, 200, 0), thickness=2)
 
         return img
-
 
 # ---------------------- UI: Auth / Bootstrap ----------------------
 def bootstrap_admin_if_empty():
