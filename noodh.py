@@ -526,11 +526,11 @@ def view_products():
 def view_sales():
     st.subheader("💰 Sales (Scan or search)")
 
-    # start the camera scanner (uses the Scanner VideoTransformer)
+    # start the camera scanner (uses the BarcodeScanner)
     webrtc_ctx = webrtc_streamer(
         key="scanner",
         mode=WebRtcMode.SENDRECV,
-        video_transformer_factory=Scanner,
+        video_transformer_factory=BarcodeScanner,
         rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
         media_stream_constraints={"video": {"facingMode": {"exact": "environment"}}, "audio": False},
         async_transform=True,
@@ -565,16 +565,10 @@ def view_sales():
         return
 
     # Look up product safely
-    prod = None
-    try:
-        prod = get_product_by_barcode(code_to_use)
-    except Exception as e:
-        st.error(f"Lookup failed: {e}")
-        return
+    prod = get_product_by_barcode(code_to_use)
 
     if not prod:
         st.warning("⚠️ Code not found in products.")
-        # show quick add product hint
         if st.button("Add new product with this barcode", key=f"addprod_{code_to_use}"):
             st.session_state.prefill_barcode = code_to_use
             st.info("Go to Products → Add new product (barcode prefilled).")
@@ -584,12 +578,8 @@ def view_sales():
     st.markdown(f"**Product:** {pname} · **Price:** {price:.2f} PKR · **Stock:** {stock}")
 
     # ensure stock is an int >= 0
-    try:
-        max_qty = max(1, int(stock))
-    except Exception:
-        max_qty = 1
+    max_qty = max(1, int(stock))
 
-    # unique keys ensure no Streamlit collisions when repeated scans occur
     qty_key = f"qty_{pid}_{code_to_use}"
     sale_key = f"sale_{pid}_{code_to_use}"
 
@@ -601,11 +591,7 @@ def view_sales():
             name, q, unit, total = info
             st.success(f"Sale logged — total {total:.2f} PKR")
             st.info(f"🧾 Receipt: {name} × {q} @ {unit:.2f} = {total:.2f} PKR")
-            # clear manual input to avoid double-selling accidentally
-            try:
-                st.session_state["manual_barcode_input"] = ""
-            except Exception:
-                pass
+            st.session_state["manual_barcode_input"] = ""
             st.experimental_rerun()
         else:
             st.error(info)
