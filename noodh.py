@@ -1,9 +1,10 @@
-# app.py — NOODH Admin POS (fixed + ready for Streamlit Cloud)
+# app.py — NOODH Admin POS (component scanner + retail/wholesale + Sell-1)
 import os
 import sqlite3
 import secrets
 import hashlib
 from datetime import datetime, timedelta
+
 from pyzbar import pyzbar
 import cv2
 import numpy as np
@@ -13,17 +14,21 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoTransformerBase
 
 # ---------------------- CONFIG ----------------------
 st.set_page_config(page_title="NOODH Admin POS", layout="wide")
+
 DB_PATH = "noodh.db"
 
 st.markdown(
     """
 <style>
+:root{--card-bg:#ffffff;--muted:#fafafa;--border:#e5e7eb;--radius:14px;}
 .block-container {max-width: 1100px;}
 h1, h2, h3 { font-weight: 700; }
-.card {border: 1px solid #e5e7eb; border-radius: 14px; padding: 16px; background: #ffffff;}
+.card {border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; background: var(--card-bg);}
 .card + .card {margin-top: 16px;}
 .stButton>button { border-radius: 10px; padding: 0.5rem 1rem; }
-.kpi {padding:12px;border:1px solid #e5e7eb;border-radius:12px;background:#fafafa;text-align:center}
+.kpi {padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--muted);text-align:center}
+.badge {padding:4px 8px;border:1px solid var(--border);border-radius:999px;background:#f8fafc;font-size:12px}
+.row {display:flex; gap:12px; align-items:center; flex-wrap:wrap}
 </style>
 """,
     unsafe_allow_html=True,
@@ -36,13 +41,12 @@ def get_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def init_db():
     conn = get_connection()
     c = conn.cursor()
+
     # users
-    c.execute(
-        """
+    c.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
@@ -50,22 +54,20 @@ def init_db():
         salt TEXT NOT NULL,
         role TEXT NOT NULL DEFAULT 'admin',
         created_at TEXT NOT NULL
-    )"""
-    )
-    # products
-    c.execute(
-        """
+    )""")
+
+    # products (legacy price kept; new retail/wholesale)
+    c.execute("""
     CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         barcode TEXT UNIQUE NOT NULL,
         price REAL NOT NULL,
         stock INTEGER NOT NULL DEFAULT 0
-    )"""
-    )
-    # sales
-    c.execute(
-        """
+    )""")
+
+    # sales (store unit_price + channel)
+    c.execute("""
     CREATE TABLE IF NOT EXISTS sales (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         product_id INTEGER NOT NULL,
@@ -75,18 +77,37 @@ def init_db():
         user_id INTEGER,
         FOREIGN KEY(product_id) REFERENCES products(id),
         FOREIGN KEY(user_id) REFERENCES users(id)
-    )"""
-    )
+    )""")
+
     # settings
-    c.execute(
-        """
+    c.execute("""
     CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT
-    )"""
-    )
-    conn.commit()
+    )""")
 
+    # ----- Safe migrations -----
+    def colnames(table):
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        return {row[1] for row in cur.fetchall()}
+
+    pcols = colnames("products")
+    if "retail_price" not in pcols:
+        c.execute("ALTER TABLE products ADD COLUMN retail_price REAL")
+    if "wholesale_price" not in pcols:
+        c.execute("ALTER TABLE products ADD COLUMN wholesale_price REAL")
+
+    scols = colnames("sales")
+    if "unit_price" not in scols:
+        c.execute("ALTER TABLE sales ADD COLUMN unit_price REAL")
+    if "channel" not in scols:
+        c.execute("ALTER TABLE sales ADD COLUMN channel TEXT")  # 'retail' | 'wholesale'
+
+    # backfill retail/wholesale from legacy price if null
+    c.execute("UPDATE products SET retail_price = COALESCE(retail_price, price)")
+    c.execute("UPDATE products SET wholesale_price = COALESCE(wholesale_price, price)")
+
+    conn.commit()
 
 # ---------------------- CACHE HELPERS ----------------------
 @st.cache_data
@@ -102,13 +123,11 @@ def cached_get_products(search: str = "") -> pd.DataFrame:
         df = pd.read_sql_query("SELECT * FROM products ORDER BY id DESC", conn)
     return df
 
-
 def invalidate_caches():
     try:
         st.cache_data.clear()
     except Exception:
         pass
-
 
 # ---------------------- SETTINGS HELPERS ----------------------
 def get_setting(key: str, default=None):
@@ -120,13 +139,17 @@ def get_setting(key: str, default=None):
         return default
     return row["value"]
 
-
 def set_setting(key: str, value):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
     conn.commit()
 
+def get_setting_bool(key: str, default=False):
+    v = get_setting(key, None)
+    if v is None:
+        return default
+    return str(v) == "1"
 
 # ---------------------- AUTH (bcrypt + PBKDF2 fallback) ----------------------
 try:
@@ -151,16 +174,18 @@ except Exception:
         return dk.hex(), salt
 
     def _verify_password(password: str, hashed: str) -> bool:
-        # Not a full pbkdf2 verification here (we store pbkdf2 hex digest in hashed in fallback scenario)
         try:
-            # If hashed length equals 64 (sha256 hex), compare
             if len(hashed) == 64:
-                test = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(hashed[:32]) if len(hashed) >= 32 else b"", 200_000)
+                test = hashlib.pbkdf2_hmac(
+                    "sha256",
+                    password.encode("utf-8"),
+                    bytes.fromhex(hashed[:32]) if len(hashed) >= 32 else b"",
+                    200_000,
+                )
                 return test.hex() == hashed
             return False
         except Exception:
             return False
-
 
 def create_user(username: str, password: str, role: str = "admin"):
     username = username.strip().lower()
@@ -168,11 +193,9 @@ def create_user(username: str, password: str, role: str = "admin"):
         return False, "Username and password required."
     if role not in ("admin", "staff"):
         role = "staff"
-    # Use _hash_password abstraction
     try:
         hashed, salt = _hash_password(password)
     except Exception:
-        # last-resort: store plain (NOT recommended) — but keep safe path
         return False, "Unable to hash password (missing dependency)."
     try:
         conn = get_connection()
@@ -186,7 +209,6 @@ def create_user(username: str, password: str, role: str = "admin"):
         return True, "User created."
     except sqlite3.IntegrityError:
         return False, "Username already exists."
-
 
 def authenticate(username: str, password: str):
     username = username.strip().lower()
@@ -202,7 +224,6 @@ def authenticate(username: str, password: str):
         return uid, role
     return None, None
 
-
 def set_password(user_id: int, new_password: str):
     try:
         hashed, salt = _hash_password(new_password)
@@ -215,12 +236,10 @@ def set_password(user_id: int, new_password: str):
     invalidate_caches()
     return True
 
-
 def list_users() -> pd.DataFrame:
     conn = get_connection()
     df = pd.read_sql_query("SELECT id, username, role, created_at FROM users ORDER BY id ASC", conn)
     return df
-
 
 def delete_user(user_id: int):
     conn = get_connection()
@@ -229,48 +248,66 @@ def delete_user(user_id: int):
     conn.commit()
     invalidate_caches()
 
-
 def users_count() -> int:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM users")
     return cur.fetchone()[0]
 
-
 # ---------------------- PRODUCTS & SALES ----------------------
 def get_products(search: str = "") -> pd.DataFrame:
     return cached_get_products(search)
 
-
 def get_product_by_barcode(code: str):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id, name, price, stock FROM products WHERE barcode=?", (code,))
+    cur.execute("""
+        SELECT id, name, stock,
+               COALESCE(retail_price, price) AS retail_price,
+               COALESCE(wholesale_price, price) AS wholesale_price
+        FROM products WHERE barcode=?
+    """, (code,))
     row = cur.fetchone()
-    return (row["id"], row["name"], row["price"], row["stock"]) if row else None
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "stock": int(row["stock"]),
+        "retail_price": float(row["retail_price"] or 0),
+        "wholesale_price": float(row["wholesale_price"] or 0),
+    }
 
-
-def add_product(name: str, barcode: str, price: float, stock: int):
+def add_product(name: str, barcode: str, price: float, stock: int,
+                retail_price: float = None, wholesale_price: float = None):
     if not name.strip() or not barcode.strip():
         return False, "All fields are required."
+    retail_price = float(retail_price if retail_price is not None else price)
+    wholesale_price = float(wholesale_price if wholesale_price is not None else price)
     try:
         conn = get_connection()
         c = conn.cursor()
-        c.execute("INSERT INTO products (name, barcode, price, stock) VALUES (?, ?, ?, ?)", (name.strip(), barcode.strip(), float(price), int(stock)))
+        c.execute("""
+            INSERT INTO products (name, barcode, price, stock, retail_price, wholesale_price)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (name.strip(), barcode.strip(), float(price), int(stock),
+              retail_price, wholesale_price))
         conn.commit()
         invalidate_caches()
         return True, "Product added."
     except sqlite3.IntegrityError:
         return False, "Barcode already exists."
 
-
-def update_product(pid: int, name: str, price: float, stock: int):
+def update_product(pid: int, name: str, retail_price: float, wholesale_price: float, stock: int):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("UPDATE products SET name=?, price=?, stock=? WHERE id=?", (name, float(price), int(stock), pid))
+    c.execute("""
+        UPDATE products
+        SET name=?, retail_price=?, wholesale_price=?, price=?, stock=?
+        WHERE id=?
+    """, (name, float(retail_price), float(wholesale_price), float(retail_price), int(stock), pid))
     conn.commit()
     invalidate_caches()
-
 
 def delete_product(pid: int):
     conn = get_connection()
@@ -279,28 +316,43 @@ def delete_product(pid: int):
     conn.commit()
     invalidate_caches()
 
-
-def log_sale(product_id: int, qty: int, user_id: int):
+def log_sale(product_id: int, qty: int, user_id: int, channel: str = "retail"):
+    channel = "wholesale" if channel == "wholesale" else "retail"
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT name, price, stock FROM products WHERE id=?", (product_id,))
+    c.execute("""
+        SELECT name, stock,
+               COALESCE(retail_price, price) AS retail_price,
+               COALESCE(wholesale_price, price) AS wholesale_price
+        FROM products WHERE id=?
+    """, (product_id,))
     row = c.fetchone()
     if not row:
         return False, "Product not found."
-    name, price, stock = row["name"], row["price"], row["stock"]
+    name = row["name"]
+    stock = int(row["stock"])
+    unit_price = float(row["wholesale_price"] if channel == "wholesale" else row["retail_price"])
+
     if qty > stock:
         return False, "Not enough stock."
-    total = float(price) * int(qty)
+
+    total = unit_price * int(qty)
     c.execute("UPDATE products SET stock=? WHERE id=?", (stock - qty, product_id))
-    c.execute("INSERT INTO sales (product_id, quantity, total_price_pkr, sale_time, user_id) VALUES (?, ?, ?, ?, ?)", (product_id, int(qty), total, datetime.utcnow().isoformat(), user_id))
+    c.execute("""
+        INSERT INTO sales (product_id, quantity, unit_price, total_price_pkr, channel, sale_time, user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (product_id, int(qty), unit_price, total, channel, datetime.utcnow().isoformat(), user_id))
     conn.commit()
     invalidate_caches()
-    return True, (name, qty, price, total)
-
+    return True, (name, qty, unit_price, total, channel)
 
 def get_sales_df(start=None, end=None, product_id=None) -> pd.DataFrame:
-    q = """SELECT s.id, p.name AS product_name, p.barcode, s.quantity, s.total_price_pkr, s.sale_time
-           FROM sales s JOIN products p ON s.product_id=p.id WHERE 1=1"""
+    q = """
+    SELECT s.id, p.name AS product_name, p.barcode,
+           s.quantity, s.unit_price, s.total_price_pkr, s.channel, s.sale_time
+    FROM sales s JOIN products p ON s.product_id=p.id
+    WHERE 1=1
+    """
     params = []
     if start:
         q += " AND date(s.sale_time) >= date(?)"
@@ -313,37 +365,168 @@ def get_sales_df(start=None, end=None, product_id=None) -> pd.DataFrame:
         params.append(product_id)
     q += " ORDER BY s.sale_time DESC"
     conn = get_connection()
-    df = pd.read_sql_query(q, conn, params=params)
-    return df
+    return pd.read_sql_query(q, conn, params=params)
 
+# ---------------------- IMAGE UTILS ----------------------
+def scan_image_bgr(img_bgr) -> list:
+    """Return list of decoded strings from a BGR image."""
+    try:
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        codes = pyzbar.decode(gray)
+        return [c.data.decode("utf-8").strip() for c in codes if c.data]
+    except Exception:
+        return []
 
-# ---------------------- SCANNER (VideoTransformerBase) ----------------------
+def scan_image_bytes(image_bytes: bytes) -> list:
+    file_array = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(file_array, cv2.IMREAD_COLOR)
+    if img is None:
+        return []
+    return scan_image_bgr(img)
+
+# ---------------------- SCANNER TRANSFORMER ----------------------
 class BarcodeScanner(VideoTransformerBase):
+    """Fast, debounced preview scanner; also keeps last frame for photo capture."""
     def __init__(self):
         self.last_data = None
         self.last_when = None
+        self._frame_i = 0
+        self._last_fired_data = None
+        self._last_fire_time = datetime.min
+        self.last_frame = None  # store last BGR frame
+
+        self.SKIP_FRAMES = 2      # decode every 3rd frame
+        self.DEBOUNCE_SECS = 2.0  # avoid duplicate fires
 
     def transform(self, frame):
         img = frame.to_ndarray(format="bgr24")
+        self.last_frame = img  # keep latest
+        self._frame_i += 1
 
-        try:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            barcodes = pyzbar.decode(gray)
-        except Exception:
-            barcodes = []
+        if self._frame_i % (self.SKIP_FRAMES + 1) == 0:
+            try:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                gray = cv2.GaussianBlur(gray, (3, 3), 0)
+                barcodes = pyzbar.decode(gray)
+            except Exception:
+                barcodes = []
 
-        for barcode in barcodes:
-            x, y, w, h = barcode.rect
-            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            for bc in barcodes:
+                x, y, w, h = bc.rect
+                data = bc.data.decode("utf-8").strip()
+                now = datetime.utcnow()
 
-            barcode_data = barcode.data.decode("utf-8")
-            self.last_data = barcode_data
-            self.last_when = datetime.utcnow()
+                # Debounce identical codes
+                if data == self._last_fired_data and (now - self._last_fire_time).total_seconds() < self.DEBOUNCE_SECS:
+                    cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 255), 2)
+                    cv2.putText(img, data, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+                    continue
 
-            cv2.putText(img, barcode_data, (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                self.last_data = data
+                self.last_when = now
+                self._last_fired_data = data
+                self._last_fire_time = now
 
+                cv2.rectangle(img, (x, y), (x+w, y+h), (0, 200, 0), 3)
+                cv2.putText(img, data, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 200, 0), 3)
         return img
+
+# ---------------------- REUSABLE SCANNER COMPONENT ----------------------
+def scanner_component(key_prefix="scan"):
+    """
+    Unified scanner UI with tabs:
+    - Live Scan (front/back camera)
+    - Photo Mode (front/back; Capture & Scan current frame)
+    - Upload Image
+    Returns dict: {"code": str|None, "source": "live"|"photo"|"upload"|None}
+    """
+    st.markdown("### 📷 Scanner")
+    tabs = st.tabs(["🎦 Live Scan", "📸 Photo", "🖼️ Upload"])
+    result = {"code": None, "source": None}
+
+    # Shared camera choice
+    with tabs[0]:
+        st.markdown("<div class='row'><span class='badge'>Choose camera</span></div>", unsafe_allow_html=True)
+        cam_side = st.radio("Camera", ["Back", "Front"], horizontal=True, key=f"{key_prefix}_live_cam")
+        facing = "environment" if cam_side == "Back" else "user"
+
+        webrtc_ctx_live = webrtc_streamer(
+            key=f"{key_prefix}_live_stream_{facing}",
+            mode=WebRtcMode.SENDRECV,
+            video_transformer_factory=BarcodeScanner,
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            media_stream_constraints={"video": {"facingMode": {"exact": facing}}, "audio": False},
+            async_transform=True,
+            desired_playing_state=True,
+        )
+        st.caption("Align the barcode inside the view. The border turns green/yellow when detected.")
+        live_code = None
+        if webrtc_ctx_live and webrtc_ctx_live.video_transformer:
+            vt = webrtc_ctx_live.video_transformer
+            if getattr(vt, "last_data", None) and getattr(vt, "last_when", None) and datetime.utcnow() - vt.last_when <= timedelta(seconds=3.0):
+                live_code = vt.last_data
+        col1, col2 = st.columns([2,1])
+        with col1:
+            st.info("Waiting for scan…") if not live_code else st.success(f"Scanned: {live_code}")
+        with col2:
+            if st.button("Use this code", disabled=not live_code, key=f"{key_prefix}_use_live"):
+                result["code"] = live_code
+                result["source"] = "live"
+                st.session_state[f"{key_prefix}_picked_code"] = live_code
+
+    with tabs[1]:
+        st.markdown("<div class='row'><span class='badge'>Photo mode</span></div>", unsafe_allow_html=True)
+        cam_side_p = st.radio("Camera", ["Back", "Front"], horizontal=True, key=f"{key_prefix}_photo_cam")
+        facing_p = "environment" if cam_side_p == "Back" else "user"
+
+        st.caption("Tap **Capture & Scan** to decode the current frame.")
+        webrtc_ctx_photo = webrtc_streamer(
+            key=f"{key_prefix}_photo_stream_{facing_p}",
+            mode=WebRtcMode.SENDRECV,
+            video_transformer_factory=BarcodeScanner,
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            media_stream_constraints={"video": {"facingMode": {"exact": facing_p}}, "audio": False},
+            async_transform=True,
+            desired_playing_state=True,
+        )
+
+        photo_feedback = st.empty()
+        if st.button("📸 Capture & Scan", key=f"{key_prefix}_capture"):
+            code = None
+            if webrtc_ctx_photo and webrtc_ctx_photo.video_transformer and getattr(webrtc_ctx_photo.video_transformer, "last_frame", None) is not None:
+                frame = webrtc_ctx_photo.video_transformer.last_frame
+                found = scan_image_bgr(frame)
+                code = found[0] if found else None
+            if code:
+                photo_feedback.success(f"Scanned: {code}")
+                result["code"] = code
+                result["source"] = "photo"
+                st.session_state[f"{key_prefix}_picked_code"] = code
+            else:
+                photo_feedback.warning("No barcode found in the captured frame.")
+
+    with tabs[2]:
+        st.markdown("<div class='row'><span class='badge'>Upload an image that contains a barcode</span></div>", unsafe_allow_html=True)
+        up = st.file_uploader("Upload image", type=["png","jpg","jpeg","webp"], key=f"{key_prefix}_uploader")
+        if up is not None:
+            codes = scan_image_bytes(up.read())
+            if codes:
+                st.success(f"Detected: {codes[0]}")
+                if st.button("Use this code", key=f"{key_prefix}_use_upload"):
+                    result["code"] = codes[0]
+                    result["source"] = "upload"
+                    st.session_state[f"{key_prefix}_picked_code"] = codes[0]
+            else:
+                st.error("No barcode found in the uploaded image.")
+
+    # If user already picked in any tab, persist it
+    picked = st.session_state.get(f"{key_prefix}_picked_code")
+    if picked and not result["code"]:
+        result["code"] = picked
+        result["source"] = st.session_state.get(f"{key_prefix}_picked_source")
+
+    return result
 
 # ---------------------- UI: Auth / Bootstrap ----------------------
 def bootstrap_admin_if_empty():
@@ -369,7 +552,6 @@ def bootstrap_admin_if_empty():
                 else:
                     st.error(msg)
     return True
-
 
 def auth_gate():
     if "user_id" not in st.session_state:
@@ -400,7 +582,6 @@ def auth_gate():
     with tab_register:
         st.info("Only admins can create users. Log in as admin first, then use User Management.")
     return False
-
 
 # ---------------------- ADMIN PAGES ----------------------
 def view_user_management():
@@ -448,7 +629,6 @@ def view_user_management():
                     st.session_state.role = None
                 st.rerun()
 
-
 # ---------------------- BUSINESS PAGES ----------------------
 def view_products():
     st.subheader("📦 Product Catalog")
@@ -462,8 +642,13 @@ def view_products():
 
     df = get_products(search)
     if not df.empty:
+        # Ensure both price columns visible
+        if "retail_price" not in df.columns or "wholesale_price" not in df.columns:
+            conn = get_connection()
+            df = pd.read_sql_query("SELECT * FROM products ORDER BY id DESC", conn)
+
         df["Low stock?"] = (df["stock"].astype(int) <= low_stock_thr).map({True: "⚠️", False: ""})
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df[["id","name","barcode","retail_price","wholesale_price","stock","Low stock?"]], use_container_width=True)
         low = df[df["stock"].astype(int) <= low_stock_thr]
         if not low.empty:
             st.warning(f"Low-stock items: {', '.join(low['name'].tolist())}")
@@ -472,14 +657,16 @@ def view_products():
 
     st.markdown("### Add new product")
     with st.form("add_product"):
-        c1, c2, c3, c4 = st.columns([3, 3, 2, 2])
+        c1, c2, c3, c4, c5 = st.columns([3, 3, 2, 2, 2])
         name = c1.text_input("Name")
         barcode = c2.text_input("Barcode")
-        price = c3.number_input("Price (PKR)", min_value=0.0, step=0.5, format="%.2f")
-        stock = c4.number_input("Stock", min_value=0, step=1)
+        retail_price = c3.number_input("Retail Price (PKR)", min_value=0.0, step=0.5, format="%.2f")
+        wholesale_price = c4.number_input("Wholesale Price (PKR)", min_value=0.0, step=0.5, format="%.2f")
+        stock = c5.number_input("Stock", min_value=0, step=1)
         add = st.form_submit_button("Add")
         if add:
-            ok, msg = add_product(name, barcode, price, stock)
+            ok, msg = add_product(name, barcode, retail_price, stock,
+                                  retail_price=retail_price, wholesale_price=wholesale_price)
             (st.success if ok else st.error)(msg)
             if ok:
                 st.rerun()
@@ -493,14 +680,18 @@ def view_products():
         row = all_df[all_df["id"] == pid].iloc[0]
 
         with st.form("edit_prod"):
-            c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+            c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 2])
             new_name = c1.text_input("Name", value=row["name"])
             c2.text_input("Barcode (immutable)", value=row["barcode"], disabled=True)
-            new_price = c3.number_input("Price (PKR)", value=float(row["price"]), step=0.5, format="%.2f")
-            new_stock = c4.number_input("Stock", value=int(row["stock"]), step=1)
+            live = get_product_by_barcode(row["barcode"])
+            rp = live["retail_price"] if live else float(row.get("retail_price", row["price"]))
+            wp = live["wholesale_price"] if live else float(row.get("wholesale_price", row["price"]))
+            new_retail = c3.number_input("Retail (PKR)", value=float(rp), step=0.5, format="%.2f")
+            new_wholesale = c4.number_input("Wholesale (PKR)", value=float(wp), step=0.5, format="%.2f")
+            new_stock = c5.number_input("Stock", value=int(row["stock"]), step=1)
             save = st.form_submit_button("Save changes")
             if save:
-                update_product(pid, new_name, new_price, new_stock)
+                update_product(pid, new_name, new_retail, new_wholesale, new_stock)
                 st.success("Updated.")
                 st.rerun()
 
@@ -509,7 +700,7 @@ def view_products():
         delta = colA.number_input("Adjust by (±)", value=0, step=1, key="quick_adj_delta")
         if colB.button("Apply"):
             if delta != 0:
-                update_product(pid, row["name"], float(row["price"]), int(row["stock"]) + int(delta))
+                update_product(pid, row["name"], float(rp), float(wp), int(row["stock"]) + int(delta))
                 st.success(("Increased" if delta > 0 else "Decreased") + " stock.")
                 st.rerun()
 
@@ -522,80 +713,99 @@ def view_products():
     else:
         st.info("No products yet.")
 
-
 def view_sales():
-    st.subheader("💰 Sales (Scan or search)")
+    st.subheader("💰 Sales")
 
-    # start the camera scanner (uses the BarcodeScanner)
-    webrtc_ctx = webrtc_streamer(
-        key="scanner",
-        mode=WebRtcMode.SENDRECV,
-        video_transformer_factory=BarcodeScanner,
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        media_stream_constraints={"video": {"facingMode": {"exact": "environment"}}, "audio": False},
-        async_transform=True,
-        desired_playing_state=True,
-    )
-    st.caption("Tip: Align the barcode inside the box. Border turns green when detected.")
+    # Settings row
+    ctop1, ctop2, ctop3 = st.columns([2, 2, 3])
+    with ctop1:
+        auto_sell = st.toggle("⚡ Auto-sell 1 on live scan", value=get_setting_bool("auto_sell_one_on_scan", False))
+        if st.button("Save", key="save_auto_sell"):
+            set_setting("auto_sell_one_on_scan", "1" if auto_sell else "0")
+            st.success("Saved")
+    with ctop2:
+        st.caption("Use photo or upload if camera is not available.")
+    with ctop3:
+        pass
 
-    # read a recent scanned value (only if it happened in the last 3 seconds)
-    scanned = None
-    if webrtc_ctx and webrtc_ctx.video_transformer:
-        vt = webrtc_ctx.video_transformer
-        if getattr(vt, "last_data", None) and getattr(vt, "last_when", None) and datetime.utcnow() - vt.last_when <= timedelta(seconds=3.0):
-            scanned = vt.last_data
+    # --- Scanner component
+    scan_out = scanner_component(key_prefix="sales_scan")
+    code_to_use = scan_out["code"]
 
-    # UI: scanned vs manual input
-    c1, c2 = st.columns([2, 3])
-    with c1:
-        st.markdown("**Last scanned**")
-        if scanned:
-            st.success(scanned)
-        else:
-            st.info("Waiting for scan…")
-
-    with c2:
-        manual = st.text_input("Or enter barcode manually", placeholder="Type or paste code…", key="manual_barcode_input")
-
-    # Choose which code to use (scanned preferred)
-    code_to_use = scanned or (manual.strip() if manual else None)
+    # Manual input fallback
+    st.markdown("#### Or enter barcode manually")
+    manual = st.text_input("Barcode", placeholder="Type or paste code…", key="manual_barcode_input")
+    if not code_to_use and manual:
+        code_to_use = manual.strip()
 
     if not code_to_use:
-        st.info("Scan a barcode with your camera or enter it manually to load product.")
+        st.info("Use the scanner above or enter a barcode.")
         return
 
-    # Look up product safely
+    # Lookup
     prod = get_product_by_barcode(code_to_use)
-
     if not prod:
-        st.warning("⚠️ Code not found in products.")
+        st.warning(f"⚠️ Code not found in products: {code_to_use}")
         if st.button("Add new product with this barcode", key=f"addprod_{code_to_use}"):
             st.session_state.prefill_barcode = code_to_use
             st.info("Go to Products → Add new product (barcode prefilled).")
         return
 
-    pid, pname, price, stock = prod
-    st.markdown(f"**Product:** {pname} · **Price:** {price:.2f} PKR · **Stock:** {stock}")
+    pid = prod["id"]
+    pname = prod["name"]
+    stock = prod["stock"]
+    retail_price = prod["retail_price"]
+    wholesale_price = prod["wholesale_price"]
 
-    # ensure stock is an int >= 0
-    max_qty = max(1, int(stock))
+    st.markdown(
+        f"<div class='card'><b>Product:</b> {pname} &nbsp;&nbsp; "
+        f"<span class='badge'>Stock: {stock}</span> &nbsp; "
+        f"<span class='badge'>Retail: {retail_price:.2f} PKR</span> &nbsp; "
+        f"<span class='badge'>Wholesale: {wholesale_price:.2f} PKR</span></div>",
+        unsafe_allow_html=True,
+    )
 
-    qty_key = f"qty_{pid}_{code_to_use}"
-    sale_key = f"sale_{pid}_{code_to_use}"
+    # sell controls
+    colA, colB, colC, colD = st.columns([2, 2, 2, 3])
+    channel = colA.radio("Price type", ["retail", "wholesale"], horizontal=True, key=f"ch_{pid}_{code_to_use}")
+    unit_price = retail_price if channel == "retail" else wholesale_price
+    qty = colB.number_input("Quantity", min_value=1, max_value=max(1, stock), step=1, value=1, key=f"qty_{pid}_{code_to_use}")
+    colC.metric("Unit (PKR)", f"{unit_price:.2f}")
+    colD.metric("Total (PKR)", f"{unit_price * qty:,.2f}")
 
-    qty = st.number_input("Quantity", min_value=1, max_value=max_qty, step=1, value=1, key=qty_key)
-
-    if st.button("Confirm Sale", key=sale_key):
-        ok, info = log_sale(pid, int(qty), st.session_state.user_id)
+    c1, c2, c3 = st.columns([1, 1, 3])
+    if c1.button("Sell 1", key=f"sell1_{pid}_{code_to_use}", disabled=(stock < 1)):
+        ok, info = log_sale(pid, 1, st.session_state.user_id, channel)
         if ok:
-            name, q, unit, total = info
-            st.success(f"Sale logged — total {total:.2f} PKR")
-            st.info(f"🧾 Receipt: {name} × {q} @ {unit:.2f} = {total:.2f} PKR")
+            name, q, up, total, ch = info
+            st.success(f"Sold 1 ({ch}) — {total:.2f} PKR")
+            st.experimental_rerun()
+        else:
+            st.error(info)
+
+    if c2.button("Confirm Sale", key=f"sale_{pid}_{code_to_use}", disabled=(qty < 1 or qty > stock)):
+        ok, info = log_sale(pid, int(qty), st.session_state.user_id, channel)
+        if ok:
+            name, q, up, total, ch = info
+            st.success(f"Sale logged — {q} @ {up:.2f} ({ch}) = {total:.2f} PKR")
             st.session_state["manual_barcode_input"] = ""
             st.experimental_rerun()
         else:
             st.error(info)
 
+    # Auto-sell when a *new* live code appears (debounced in transformer)
+    if scan_out["source"] == "live" and auto_sell and stock >= 1:
+        # minimal dedupe per run
+        fire_key = f"autosell_fired_{code_to_use}_{datetime.utcnow().strftime('%H%M%S')}"
+        if not st.session_state.get(fire_key):
+            st.session_state[fire_key] = True
+            ok, info = log_sale(pid, 1, st.session_state.user_id, channel="retail")
+            if ok:
+                name, q, up, total, ch = info
+                st.success(f"Auto-sold 1 — {total:.2f} PKR")
+                st.experimental_rerun()
+            else:
+                st.error(info)
 
 def view_dashboard():
     st.subheader("📊 Dashboard")
@@ -640,9 +850,13 @@ def view_dashboard():
         st.markdown("**Top Products**")
         st.bar_chart(top)
 
+    by_channel = df_sales.groupby("channel")["total_price_pkr"].sum().sort_values(ascending=False)
+    if not by_channel.empty:
+        st.markdown("**Revenue by Channel**")
+        st.bar_chart(by_channel)
+
     csv = df_sales.to_csv(index=False).encode("utf-8")
     st.download_button("Export CSV", data=csv, file_name=f"sales_{start}_{end}.csv", mime="text/csv")
-
 
 def view_backup():
     st.subheader("🗂️ Backup & Restore")
@@ -661,7 +875,6 @@ def view_backup():
             except Exception as e:
                 st.error(f"Restore failed: {e}")
 
-
 # ---------------------- MAIN ----------------------
 def main():
     init_db()
@@ -670,7 +883,7 @@ def main():
         st.stop()
 
     st.header("NOODH — Admin POS")
-    st.caption("Secure admin console · Mobile camera scanning · Streamlit")
+    st.caption("Secure admin console · Dual pricing · Component scanner")
 
     if not auth_gate():
         st.stop()
@@ -698,7 +911,6 @@ def main():
         view_backup()
     else:
         view_sales()
-
 
 if __name__ == "__main__":
     main()
