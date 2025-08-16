@@ -1,4 +1,4 @@
-# app.py — Enhanced NOODH Admin POS with Returns and Optimized Scanner
+# app.py — Enhanced NOODH Admin POS with Returns and Enhanced Scanner
 import os
 import sqlite3
 import secrets
@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 
-# Import our optimized scanner
-from scanner import create_scanner_interface, create_advanced_scanner_settings
+# Import our enhanced scanner
+from enhanced_scanner import create_enhanced_scanner_interface, create_scanner_settings_panel
 
 # ---------------------- CONFIG ----------------------
 st.set_page_config(page_title="NOODH Admin POS", layout="wide")
@@ -437,10 +437,10 @@ def view_sales_and_returns():
     sales_tab, returns_tab = st.tabs(["🛒 Sales", "↩️ Returns"])
     
     with sales_tab:
-        st.markdown("#### Product Scanner")
+        st.markdown("#### Enhanced Product Scanner")
         
-        # Scanner interface
-        scan_result = create_scanner_interface(key_prefix="sales_scanner")
+        # Enhanced scanner interface with all new features
+        scan_result = create_enhanced_scanner_interface(key_prefix="sales_scanner", show_advanced=True)
         
         if scan_result["code"]:
             code = scan_result["code"]
@@ -448,26 +448,47 @@ def view_sales_and_returns():
             
             if not prod:
                 st.warning(f"⚠️ Product not found: {code}")
-                if st.button("➕ Add New Product", key="add_new_from_scan"):
-                    # Store the barcode for use in products page
-                    st.session_state["prefill_barcode"] = code
-                    st.info("Switch to Products tab to add this item.")
+                
+                # Enhanced add new product experience
+                st.markdown("""
+                <div class='warning-box'>
+                    <h4>🆕 Product Not Found</h4>
+                    <p>The scanned barcode <code>{}</code> is not in your inventory.</p>
+                    <p>Would you like to add this as a new product?</p>
+                </div>
+                """.format(code), unsafe_allow_html=True)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("➕ Add New Product", key="add_new_from_scan", type="primary"):
+                        # Store the barcode for use in products page
+                        st.session_state["prefill_barcode"] = code
+                        st.success("✅ Barcode saved! Switch to Products tab to add this item.")
+                
+                with col2:
+                    if st.button("🔍 Search Again", key="search_again"):
+                        st.rerun()
                 return
             
-            # Display product information
+            # Enhanced product information display
+            confidence_indicator = "🟢" if scan_result["confidence"] > 0.8 else "🟡" if scan_result["confidence"] > 0.6 else "🔴"
+            scan_type_badge = f"<span class='badge'>{scan_result['type'] or 'Unknown'}</span>" if scan_result.get('type') else ""
+            
             st.markdown(f"""
-            <div class='card'>
-                <h4>📦 {prod['name']}</h4>
+            <div class='success-box'>
+                <h4>📦 {prod['name']} {confidence_indicator}</h4>
                 <div class='row'>
                     <span class='badge'>Stock: {prod['stock']}</span>
                     <span class='badge'>Retail: {prod['retail_price']:.2f} PKR</span>
                     <span class='badge'>Wholesale: {prod['wholesale_price']:.2f} PKR</span>
                     <span class='badge'>Barcode: {code}</span>
+                    {scan_type_badge}
+                    <span class='badge'>Confidence: {scan_result['confidence']:.0%}</span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
             
-            # Sales controls
+            # Sales controls with enhanced UI
             col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
             
             with col1:
@@ -480,42 +501,77 @@ def view_sales_and_returns():
                     max_value=max(1, prod['stock']), 
                     value=1, 
                     step=1,
-                    key=f"qty_{code}"
+                    key=f"qty_{code}",
+                    help=f"Available stock: {prod['stock']}"
                 )
             
             unit_price = prod['retail_price'] if channel == 'retail' else prod['wholesale_price']
             total_price = unit_price * quantity
             
             with col3:
-                st.metric("Unit Price", f"{unit_price:.2f} PKR")
+                st.metric("Unit Price", f"{unit_price:.2f} PKR", help=f"{channel.title()} price")
             
             with col4:
-                st.metric("Total", f"{total_price:.2f} PKR")
+                st.metric("Total", f"{total_price:.2f} PKR", help="Quantity × Unit Price")
             
-            # Sale buttons
-            col_a, col_b, col_c = st.columns([1, 1, 2])
+            # Enhanced sale buttons with better UX
+            st.markdown("#### 💳 Process Sale")
+            col_a, col_b, col_c = st.columns([2, 2, 2])
             
             with col_a:
-                if st.button("🚀 Quick Sell (1)", disabled=prod['stock'] < 1, key=f"quick_{code}"):
+                quick_sell_disabled = prod['stock'] < 1
+                quick_button_type = "secondary" if quick_sell_disabled else "primary"
+                if st.button("🚀 Quick Sell (1)", 
+                           disabled=quick_sell_disabled, 
+                           key=f"quick_{code}",
+                           type=quick_button_type,
+                           help="Instantly sell 1 unit"):
                     success, result = log_sale(prod['id'], 1, st.session_state.user_id, channel)
                     if success:
                         name, qty, unit_p, total, ch, trans_type = result
-                        st.success(f"✅ Sold 1x {name} for {total:.2f} PKR ({ch})")
+                        st.success(f"✅ Quick sale completed!")
+                        st.balloons()
                         st.rerun()
                     else:
-                        st.error(result)
+                        st.error(f"❌ {result}")
             
             with col_b:
-                if st.button("💳 Process Sale", disabled=quantity > prod['stock'], key=f"sale_{code}"):
+                custom_sell_disabled = quantity > prod['stock']
+                custom_button_type = "secondary" if custom_sell_disabled else "primary"
+                if st.button("💰 Process Sale", 
+                           disabled=custom_sell_disabled, 
+                           key=f"sale_{code}",
+                           type=custom_button_type,
+                           help=f"Sell {quantity} unit(s)"):
                     success, result = log_sale(prod['id'], quantity, st.session_state.user_id, channel)
                     if success:
                         name, qty, unit_p, total, ch, trans_type = result
                         st.success(f"✅ Sale completed: {qty}x {name} = {total:.2f} PKR ({ch})")
+                        st.balloons()
                         st.rerun()
                     else:
-                        st.error(result)
+                        st.error(f"❌ {result}")
+            
+            with col_c:
+                if st.button("🔄 Scan Another", key=f"scan_another_{code}", help="Clear and scan next item"):
+                    # Clear the scanner state
+                    if f"sales_scanner_enhanced_scanner" in st.session_state:
+                        del st.session_state[f"sales_scanner_enhanced_scanner"]
+                    st.rerun()
         else:
-            st.info("👆 Scan a barcode or enter manually to start selling")
+            # Enhanced empty state with tips
+            st.markdown("""
+            <div class='card'>
+                <h4>👆 Ready to Scan</h4>
+                <p>Use the enhanced scanner above to:</p>
+                <ul>
+                    <li>📱 <strong>Smart Camera:</strong> Scan with AI-powered detection and visual guides</li>
+                    <li>🖼️ <strong>AI Upload:</strong> Upload images with advanced processing</li>
+                    <li>⌨️ <strong>Quick Entry:</strong> Type barcodes manually or use keyboard wedge</li>
+                </ul>
+                <p><em>The scanner now features improved accuracy, visual guides, and real-time confidence scoring!</em></p>
+            </div>
+            """, unsafe_allow_html=True)
     
     with returns_tab:
         st.markdown("#### Process Returns")
@@ -529,7 +585,7 @@ def view_sales_and_returns():
         
         if return_method == "Scan Product":
             st.markdown("**Scan the product to return:**")
-            return_scan = create_scanner_interface(key_prefix="return_scanner")
+            return_scan = create_enhanced_scanner_interface(key_prefix="return_scanner", show_advanced=False)
             
             if return_scan["code"]:
                 return_code = return_scan["code"]
@@ -539,11 +595,14 @@ def view_sales_and_returns():
                     st.error(f"Product not found: {return_code}")
                     return
                 
+                confidence_indicator = "🟢" if return_scan["confidence"] > 0.8 else "🟡" if return_scan["confidence"] > 0.6 else "🔴"
+                
                 st.markdown(f"""
                 <div class='warning-box'>
-                    <h4>🔄 Processing Return</h4>
+                    <h4>🔄 Processing Return {confidence_indicator}</h4>
                     <p><strong>Product:</strong> {return_prod['name']}</p>
                     <p><strong>Current Stock:</strong> {return_prod['stock']}</p>
+                    <p><strong>Scan Confidence:</strong> {return_scan['confidence']:.0%}</p>
                 </div>
                 """, unsafe_allow_html=True)
                 
@@ -564,7 +623,7 @@ def view_sales_and_returns():
                     
                     final_reason = other_reason if return_reason == "Other" else return_reason
                     
-                    if st.form_submit_button("🔄 Process Return"):
+                    if st.form_submit_button("🔄 Process Return", type="primary"):
                         success, result = log_sale(
                             return_prod['id'], 
                             return_qty, 
@@ -577,9 +636,10 @@ def view_sales_and_returns():
                         if success:
                             name, qty, unit_p, total, ch, trans_type = result
                             st.success(f"✅ Return processed: {qty}x {name} = {abs(total):.2f} PKR refund")
+                            st.balloons()
                             st.rerun()
                         else:
-                            st.error(result)
+                            st.error(f"❌ {result}")
         
         else:  # Select from recent sales
             st.markdown("**Recent Sales (Last 30 days):**")
@@ -589,10 +649,11 @@ def view_sales_and_returns():
                 st.info("No recent sales found for returns.")
                 return
             
-            # Display recent sales
+            # Enhanced display of recent sales
             st.dataframe(
                 recent_sales[['id', 'product_name', 'quantity', 'total_price_pkr', 'channel', 'sale_time', 'username']], 
-                use_container_width=True
+                use_container_width=True,
+                hide_index=True
             )
             
             # Select sale for return
@@ -631,7 +692,7 @@ def view_sales_and_returns():
                     
                     final_reason = other_reason if return_reason == "Other" else return_reason
                     
-                    if st.form_submit_button("🔄 Process Return from Sale"):
+                    if st.form_submit_button("🔄 Process Return from Sale", type="primary"):
                         # Get product info
                         return_prod = get_product_by_barcode(sale_row['barcode'])
                         if return_prod:
@@ -648,9 +709,10 @@ def view_sales_and_returns():
                             if success:
                                 name, qty, unit_p, total, ch, trans_type = result
                                 st.success(f"✅ Return processed: {qty}x {name} = {abs(total):.2f} PKR refund")
+                                st.balloons()
                                 st.rerun()
                             else:
-                                st.error(result)
+                                st.error(f"❌ {result}")
 
 def view_products():
     st.subheader("📦 Product Management")
@@ -662,6 +724,7 @@ def view_products():
     with col2:
         low_stock_threshold = st.number_input("Low Stock Alert", min_value=0, value=5, step=1)
     with col3:
+        st.markdown("<br>", unsafe_allow_html=True)  # Spacing
         if st.button("💾 Save Threshold"):
             set_setting("low_stock_threshold", low_stock_threshold)
             st.success("Saved!")
@@ -675,10 +738,20 @@ def view_products():
             lambda x: "🔴 Low Stock" if x <= low_stock_threshold else "✅ In Stock"
         )
         
-        # Display products table
+        # Enhanced products table display
         st.dataframe(
             df[['id', 'name', 'barcode', 'retail_price', 'wholesale_price', 'stock', 'Status']], 
-            use_container_width=True
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "id": "ID",
+                "name": "Product Name",
+                "barcode": "Barcode",
+                "retail_price": st.column_config.NumberColumn("Retail Price (PKR)", format="%.2f"),
+                "wholesale_price": st.column_config.NumberColumn("Wholesale Price (PKR)", format="%.2f"),
+                "stock": "Stock",
+                "Status": "Status"
+            }
         )
         
         # Show low stock alerts
@@ -688,48 +761,77 @@ def view_products():
     else:
         st.info("No products found.")
     
-    # Add new product section
+    # Enhanced add new product section
     st.markdown("### ➕ Add New Product")
     
     # Check if barcode was scanned from sales page
     prefill_barcode = st.session_state.get("prefill_barcode", "")
     if prefill_barcode:
-        st.info(f"Adding product for scanned barcode: {prefill_barcode}")
+        st.markdown(f"""
+        <div class='success-box'>
+            <h4>📱 Scanned Barcode Ready</h4>
+            <p>Adding product for scanned barcode: <code>{prefill_barcode}</code></p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Enhanced scanner for adding products
+    st.markdown("#### 📱 Scan New Product Barcode")
+    add_product_scan = create_enhanced_scanner_interface(key_prefix="add_product_scanner", show_advanced=False)
+    
+    # Use scanned barcode if available
+    if add_product_scan["code"] and not prefill_barcode:
+        prefill_barcode = add_product_scan["code"]
+        st.session_state["prefill_barcode"] = prefill_barcode
+        st.rerun()
     
     with st.form("add_product_form"):
         col1, col2 = st.columns(2)
         
         with col1:
-            product_name = st.text_input("Product Name")
-            barcode = st.text_input("Barcode", value=prefill_barcode)
-            initial_stock = st.number_input("Initial Stock", min_value=0, value=0, step=1)
+            product_name = st.text_input("Product Name", help="Enter a descriptive product name")
+            barcode = st.text_input("Barcode", value=prefill_barcode, help="Scan or enter barcode manually")
+            initial_stock = st.number_input("Initial Stock", min_value=0, value=0, step=1, help="Starting inventory quantity")
         
         with col2:
-            retail_price = st.number_input("Retail Price (PKR)", min_value=0.0, step=0.50, format="%.2f")
-            wholesale_price = st.number_input("Wholesale Price (PKR)", min_value=0.0, step=0.50, format="%.2f")
+            retail_price = st.number_input("Retail Price (PKR)", min_value=0.0, step=0.50, format="%.2f", help="Customer selling price")
+            wholesale_price = st.number_input("Wholesale Price (PKR)", min_value=0.0, step=0.50, format="%.2f", help="Bulk/trade price")
+            st.markdown("<br><br>", unsafe_allow_html=True)  # Spacing
         
-        if st.form_submit_button("➕ Add Product"):
+        # Enhanced form submission
+        col_submit1, col_submit2 = st.columns(2)
+        with col_submit1:
+            submit_add = st.form_submit_button("➕ Add Product", type="primary")
+        with col_submit2:
+            clear_form = st.form_submit_button("🗑️ Clear Form")
+        
+        if submit_add:
             if product_name and barcode:
                 success, message = add_product(
                     product_name, barcode, retail_price, initial_stock,
                     retail_price, wholesale_price
                 )
                 if success:
-                    st.success(message)
+                    st.success(f"✅ {message}")
                     # Clear prefilled barcode
                     if "prefill_barcode" in st.session_state:
                         del st.session_state["prefill_barcode"]
+                    st.balloons()
                     st.rerun()
                 else:
-                    st.error(message)
+                    st.error(f"❌ {message}")
             else:
-                st.error("Please fill in all required fields.")
+                st.error("❌ Please fill in all required fields.")
+        
+        if clear_form:
+            if "prefill_barcode" in st.session_state:
+                del st.session_state["prefill_barcode"]
+            st.rerun()
 
 def view_dashboard():
     st.subheader("📊 Sales Dashboard")
     
-    # Date range selector
-    col1, col2, col3 = st.columns([2, 2, 2])
+    # Enhanced date range selector
+    col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
     today = datetime.now().date()
     
     with col1:
@@ -738,6 +840,8 @@ def view_dashboard():
         end_date = st.date_input("End Date", value=today)
     with col3:
         include_returns = st.checkbox("Include Returns", value=True)
+    with col4:
+        auto_refresh = st.checkbox("Auto Refresh", value=False, help="Refresh data automatically")
     
     # Get sales data
     sales_df = get_sales_df(
@@ -750,7 +854,7 @@ def view_dashboard():
         st.info("No transactions found for the selected period.")
         return
     
-    # Calculate metrics
+    # Calculate enhanced metrics
     sales_only = sales_df[sales_df['transaction_type'] == 'sale']
     returns_only = sales_df[sales_df['transaction_type'] == 'return']
     
@@ -760,9 +864,11 @@ def view_dashboard():
     
     total_orders = len(sales_only)
     total_return_orders = len(returns_only)
+    total_items_sold = sales_only['quantity'].sum() if not sales_only.empty else 0
     
-    # Display KPIs
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    # Enhanced KPI display
+    st.markdown("#### 📈 Key Performance Indicators")
+    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
     
     with kpi1:
         st.metric("Total Sales", f"{total_sales:,.2f} PKR", help="Total sales revenue")
@@ -773,8 +879,28 @@ def view_dashboard():
     with kpi4:
         return_rate = (total_return_orders / total_orders * 100) if total_orders > 0 else 0
         st.metric("Return Rate", f"{return_rate:.1f}%", help="Percentage of orders returned")
+    with kpi5:
+        avg_order_value = (total_sales / total_orders) if total_orders > 0 else 0
+        st.metric("Avg Order Value", f"{avg_order_value:.2f} PKR", help="Average sale amount")
     
-    # Charts
+    # Additional metrics row
+    kpi6, kpi7, kpi8, kpi9 = st.columns(4)
+    
+    with kpi6:
+        st.metric("Total Orders", f"{total_orders:,}", help="Number of sales transactions")
+    with kpi7:
+        st.metric("Items Sold", f"{total_items_sold:,}", help="Total quantity of items sold")
+    with kpi8:
+        days_in_period = (end_date - start_date).days + 1
+        daily_avg = net_revenue / days_in_period if days_in_period > 0 else 0
+        st.metric("Daily Average", f"{daily_avg:.2f} PKR", help="Average daily revenue")
+    with kpi9:
+        retail_sales = sales_only[sales_only['channel'] == 'retail']['total_price_pkr'].sum() if not sales_only.empty else 0
+        wholesale_sales = sales_only[sales_only['channel'] == 'wholesale']['total_price_pkr'].sum() if not sales_only.empty else 0
+        retail_percentage = (retail_sales / total_sales * 100) if total_sales > 0 else 0
+        st.metric("Retail %", f"{retail_percentage:.1f}%", help="Percentage of retail vs wholesale sales")
+    
+    # Enhanced charts
     col1, col2 = st.columns(2)
     
     with col1:
@@ -783,7 +909,20 @@ def view_dashboard():
             daily_sales = sales_only.copy()
             daily_sales['date'] = pd.to_datetime(daily_sales['sale_time']).dt.date
             daily_summary = daily_sales.groupby('date')['total_price_pkr'].sum().reset_index()
-            st.line_chart(daily_summary.set_index('date')['total_price_pkr'])
+            
+            # Add returns to the chart if included
+            if include_returns and not returns_only.empty:
+                daily_returns = returns_only.copy()
+                daily_returns['date'] = pd.to_datetime(daily_returns['sale_time']).dt.date
+                daily_returns_summary = daily_returns.groupby('date')['total_price_pkr'].sum().reset_index()
+                daily_returns_summary['total_price_pkr'] = abs(daily_returns_summary['total_price_pkr'])
+                
+                # Merge sales and returns
+                chart_data = daily_summary.merge(daily_returns_summary, on='date', how='outer', suffixes=('_sales', '_returns')).fillna(0)
+                chart_data['net'] = chart_data['total_price_pkr_sales'] - chart_data['total_price_pkr_returns']
+                st.line_chart(chart_data.set_index('date')[['total_price_pkr_sales', 'total_price_pkr_returns', 'net']])
+            else:
+                st.line_chart(daily_summary.set_index('date')['total_price_pkr'])
         else:
             st.info("No sales data to display")
     
@@ -795,11 +934,27 @@ def view_dashboard():
         else:
             st.info("No sales data to display")
     
-    # Detailed transactions table
+    # Channel analysis
+    if not sales_only.empty:
+        col3, col4 = st.columns(2)
+        
+        with col3:
+            st.markdown("#### 💰 Sales by Channel")
+            channel_sales = sales_only.groupby('channel')['total_price_pkr'].sum()
+            st.bar_chart(channel_sales)
+        
+        with col4:
+            st.markdown("#### 📊 Hourly Sales Pattern")
+            hourly_sales = sales_only.copy()
+            hourly_sales['hour'] = pd.to_datetime(hourly_sales['sale_time']).dt.hour
+            hourly_summary = hourly_sales.groupby('hour')['total_price_pkr'].sum()
+            st.line_chart(hourly_summary)
+    
+    # Enhanced transactions table
     st.markdown("#### 📋 Transaction Details")
     
-    # Add filters
-    filter_col1, filter_col2 = st.columns(2)
+    # Enhanced filters
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
     with filter_col1:
         transaction_filter = st.selectbox(
             "Filter by Type", 
@@ -809,6 +964,11 @@ def view_dashboard():
         product_filter = st.selectbox(
             "Filter by Product", 
             ["All Products"] + list(sales_df['product_name'].unique())
+        )
+    with filter_col3:
+        channel_filter = st.selectbox(
+            "Filter by Channel",
+            ["All Channels", "Retail", "Wholesale"]
         )
     
     # Apply filters
@@ -821,20 +981,66 @@ def view_dashboard():
     if product_filter != "All Products":
         filtered_df = filtered_df[filtered_df['product_name'] == product_filter]
     
-    # Display filtered data
+    if channel_filter != "All Channels":
+        filtered_df = filtered_df[filtered_df['channel'] == channel_filter.lower()]
+    
+    # Display filtered data with enhanced formatting
     if not filtered_df.empty:
         display_df = filtered_df[['id', 'product_name', 'quantity', 'unit_price', 'total_price_pkr', 
                                 'channel', 'transaction_type', 'sale_time', 'username', 'return_reason']]
-        st.dataframe(display_df, use_container_width=True)
         
-        # Export functionality
-        csv_data = display_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            "📥 Export to CSV",
-            data=csv_data,
-            file_name=f"transactions_{start_date}_to_{end_date}.csv",
-            mime="text/csv"
+        st.dataframe(
+            display_df, 
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "id": "Transaction ID",
+                "product_name": "Product",
+                "quantity": "Qty",
+                "unit_price": st.column_config.NumberColumn("Unit Price", format="%.2f PKR"),
+                "total_price_pkr": st.column_config.NumberColumn("Total", format="%.2f PKR"),
+                "channel": "Channel",
+                "transaction_type": "Type",
+                "sale_time": st.column_config.DatetimeColumn("Date/Time"),
+                "username": "User",
+                "return_reason": "Return Reason"
+            }
         )
+        
+        # Enhanced export functionality
+        col_export1, col_export2, col_export3 = st.columns(3)
+        
+        with col_export1:
+            csv_data = display_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "📥 Export to CSV",
+                data=csv_data,
+                file_name=f"transactions_{start_date}_to_{end_date}.csv",
+                mime="text/csv"
+            )
+        
+        with col_export2:
+            # Summary export
+            summary_data = {
+                'Total Sales': [f"{total_sales:.2f} PKR"],
+                'Total Returns': [f"{total_returns:.2f} PKR"],
+                'Net Revenue': [f"{net_revenue:.2f} PKR"],
+                'Total Orders': [total_orders],
+                'Return Rate': [f"{return_rate:.1f}%"]
+            }
+            summary_df = pd.DataFrame(summary_data)
+            summary_csv = summary_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "📊 Export Summary",
+                data=summary_csv,
+                file_name=f"summary_{start_date}_to_{end_date}.csv",
+                mime="text/csv"
+            )
+        
+        with col_export3:
+            if st.button("🔄 Refresh Data", help="Refresh dashboard data"):
+                invalidate_caches()
+                st.rerun()
     else:
         st.info("No transactions match the selected filters.")
 
@@ -850,31 +1056,39 @@ def main():
     if not auth_gate():
         st.stop()
     
-    # Header
+    # Enhanced header
     st.title("🏪 NOODH POS System")
-    st.caption(f"Welcome back, {st.session_state.username} ({st.session_state.role})")
+    st.caption(f"Welcome back, **{st.session_state.username}** ({st.session_state.role}) • Enhanced with AI Scanner")
     
-    # Sidebar navigation
+    # Sidebar navigation with enhanced UI
     with st.sidebar:
-        st.markdown(f"**👤 {st.session_state.username}** ({st.session_state.role})")
+        st.markdown(f"""
+        <div class='card'>
+            <h4>👤 User Session</h4>
+            <p><strong>{st.session_state.username}</strong></p>
+            <p><em>{st.session_state.role.title()}</em></p>
+        </div>
+        """, unsafe_allow_html=True)
         
-        if st.button("🚪 Logout"):
+        if st.button("🚪 Logout", type="secondary"):
             st.session_state.clear()
             st.rerun()
         
         st.markdown("---")
         
-        # Navigation menu
+        # Enhanced navigation menu
+        st.markdown("### 🧭 Navigation")
         menu_options = ["🛒 Sales & Returns", "📦 Products", "📊 Dashboard"]
         
         # Add admin-only options
         if st.session_state.role == "admin":
             menu_options.append("⚙️ Settings")
         
-        selected_page = st.radio("Navigation", menu_options, index=0)
+        selected_page = st.radio("", menu_options, index=0)
     
-    # Advanced scanner settings in sidebar
-    create_advanced_scanner_settings()
+    # Enhanced scanner settings in sidebar
+    st.sidebar.markdown("---")
+    create_scanner_settings_panel()
     
     # Route to selected page
     if selected_page == "🛒 Sales & Returns":
@@ -885,7 +1099,25 @@ def main():
         view_dashboard()
     elif selected_page == "⚙️ Settings" and st.session_state.role == "admin":
         st.subheader("⚙️ System Settings")
-        st.info("Settings panel - Add user management, backup/restore, etc.")
+        
+        # Enhanced settings page
+        settings_tabs = st.tabs(["👥 User Management", "🔧 System Config", "📱 Scanner Settings", "💾 Data Management"])
+        
+        with settings_tabs[0]:
+            st.markdown("#### User Management")
+            st.info("User management features - Create/edit users, roles, permissions")
+        
+        with settings_tabs[1]:
+            st.markdown("#### System Configuration")
+            st.info("System settings - Business info, tax rates, receipt templates")
+        
+        with settings_tabs[2]:
+            st.markdown("#### Scanner Configuration")
+            st.info("Advanced scanner settings and calibration")
+        
+        with settings_tabs[3]:
+            st.markdown("#### Data Management")
+            st.info("Backup, restore, and data export/import features")
 
 if __name__ == "__main__":
     main()
