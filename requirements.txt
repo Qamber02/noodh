@@ -1,8 +1,6 @@
 streamlit
-pandas
-numpy
-opencv-python-headless
-av
 streamlit-webrtc
+opencv-python-headless
+numpy
+pandas
 bcrypt
-sqlalchemy
