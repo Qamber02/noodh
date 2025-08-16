@@ -32,9 +32,7 @@ h1, h2, h3 { font-weight: 700; }
 # ---------------------- DB (cached resource) ----------------------
 @st.cache_resource
 def get_connection():
-    # Single shared connection for the app process (Streamlit will cache it)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    # Use row factory for nicer tuple->dict conversions when needed
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -106,20 +104,36 @@ def cached_get_products(search: str = "") -> pd.DataFrame:
 
 
 def invalidate_caches():
-    # Clear cached read results after writes
     try:
         st.cache_data.clear()
     except Exception:
         pass
 
 
+# ---------------------- SETTINGS HELPERS ----------------------
+def get_setting(key: str, default=None):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = cur.fetchone()
+    if not row:
+        return default
+    return row["value"]
+
+
+def set_setting(key: str, value):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+    conn.commit()
+
+
 # ---------------------- AUTH (bcrypt + PBKDF2 fallback) ----------------------
-# We'll use bcrypt if available; otherwise fallback to PBKDF2 (but requirements should include bcrypt)
 try:
     import bcrypt  # type: ignore
 
     def _hash_password(password: str) -> (str, str):
-        salt = bcrypt.gensalt().hex()  # store hex of gensalt bytes
+        salt = bcrypt.gensalt().hex()
         hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
         return hashed, salt
 
@@ -130,17 +144,19 @@ try:
             return False
 
 except Exception:
-    # Fallback (PBKDF2) - still OK, but bcrypt preferred
+    # Fallback (PBKDF2)
     def _hash_password(password: str) -> (str, str):
         salt = secrets.token_hex(16)
         dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000)
         return dk.hex(), salt
 
     def _verify_password(password: str, hashed: str) -> bool:
-        # hashed is hex digest from PBKDF2 approach
-        # Try to verify with pbkdf2 if hashed length matches
+        # Not a full pbkdf2 verification here (we store pbkdf2 hex digest in hashed in fallback scenario)
         try:
-            # assume salt stored elsewhere (we use separate salt column)
+            # If hashed length equals 64 (sha256 hex), compare
+            if len(hashed) == 64:
+                test = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(hashed[:32]) if len(hashed) >= 32 else b"", 200_000)
+                return test.hex() == hashed
             return False
         except Exception:
             return False
@@ -152,10 +168,12 @@ def create_user(username: str, password: str, role: str = "admin"):
         return False, "Username and password required."
     if role not in ("admin", "staff"):
         role = "staff"
-    # Use bcrypt hash (stored as text), and save a salt hex if needed
-    # To keep retrieval simple, store hashed and a generated salt value (not used by bcrypt)
-    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    salt = secrets.token_hex(16)
+    # Use _hash_password abstraction
+    try:
+        hashed, salt = _hash_password(password)
+    except Exception:
+        # last-resort: store plain (NOT recommended) — but keep safe path
+        return False, "Unable to hash password (missing dependency)."
     try:
         conn = get_connection()
         c = conn.cursor()
@@ -179,22 +197,23 @@ def authenticate(username: str, password: str):
     if not row:
         return None, None
     uid, stored_hash, salt, role = row["id"], row["password_hash"], row["salt"], row["role"]
-    try:
-        ok = bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
-    except Exception:
-        ok = False
+    ok = _verify_password(password, stored_hash)
     if ok:
         return uid, role
     return None, None
 
 
 def set_password(user_id: int, new_password: str):
-    hashed = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    try:
+        hashed, salt = _hash_password(new_password)
+    except Exception:
+        return False
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE users SET password_hash=?, salt=? WHERE id=?", (hashed, secrets.token_hex(16), user_id))
+    cur.execute("UPDATE users SET password_hash=?, salt=? WHERE id=?", (hashed, salt, user_id))
     conn.commit()
     invalidate_caches()
+    return True
 
 
 def list_users() -> pd.DataFrame:
@@ -220,7 +239,6 @@ def users_count() -> int:
 
 # ---------------------- PRODUCTS & SALES ----------------------
 def get_products(search: str = "") -> pd.DataFrame:
-    # wrapper around cached_get_products
     return cached_get_products(search)
 
 
@@ -323,7 +341,11 @@ class Scanner(VideoTransformerBase):
             barcodes = pyzbar.decode(roi)
             self.ok = bool(barcodes)
             if self.ok:
-                self.last_data = barcodes[0].data.decode("utf-8")
+                # pick first barcode value
+                try:
+                    self.last_data = barcodes[0].data.decode("utf-8")
+                except Exception:
+                    self.last_data = str(barcodes[0].data)
                 self.last_when = now
             self._last_scan_time = now
 
@@ -341,7 +363,7 @@ class Scanner(VideoTransformerBase):
         label = "Detected" if self.ok else "Align barcode in the box"
         cv2.putText(img, label, (x1, max(30, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-        # draw bounding box around barcodes
+        # draw bounding boxes for detected barcodes
         barcodes = pyzbar.decode(roi)
         for bc in barcodes:
             pts = bc.polygon
@@ -350,6 +372,7 @@ class Scanner(VideoTransformerBase):
                 cv2.polylines(img, [pts], isClosed=True, color=(0, 200, 0), thickness=2)
 
         return img
+
 
 # ---------------------- UI: Auth / Bootstrap ----------------------
 def bootstrap_admin_if_empty():
@@ -459,7 +482,7 @@ def view_user_management():
 def view_products():
     st.subheader("📦 Product Catalog")
     cA, cB, cC = st.columns([3, 2, 2])
-    search = cA.text_input("Search by name or barcode", placeholder="Type here…")
+    search = cA.text_input("Search by name or barcode", placeholder="Type here…", key="products_search")
     low_stock_thr = int(get_setting("low_stock_threshold", 3) or 3)
     low_stock_thr = cB.number_input("Low-stock threshold", min_value=0, value=low_stock_thr, step=1)
     if cC.button("Save threshold"):
@@ -494,7 +517,7 @@ def view_products():
     all_df = get_products()
     if not all_df.empty:
         options = [f"{r['id']} — {r['name']} ({r['barcode']})" for _, r in all_df.iterrows()]
-        sel = st.selectbox("Select product", options)
+        sel = st.selectbox("Select product", options, key="select_product_edit")
         pid = int(sel.split(" — ")[0])
         row = all_df[all_df["id"] == pid].iloc[0]
 
@@ -512,7 +535,7 @@ def view_products():
 
         st.markdown("**Quick stock adjust**")
         colA, colB, colC = st.columns([2, 2, 3])
-        delta = colA.number_input("Adjust by (±)", value=0, step=1)
+        delta = colA.number_input("Adjust by (±)", value=0, step=1, key="quick_adj_delta")
         if colB.button("Apply"):
             if delta != 0:
                 update_product(pid, row["name"], float(row["price"]), int(row["stock"]) + int(delta))
@@ -520,7 +543,7 @@ def view_products():
                 st.rerun()
 
         st.warning("Deleting a product removes it from the catalog (sales history remains).")
-        confirm = colC.checkbox("Confirm delete")
+        confirm = colC.checkbox("Confirm delete", key="confirm_delete_prod")
         if colC.button("Delete selected product", disabled=not confirm):
             delete_product(pid)
             st.success("Deleted.")
@@ -529,13 +552,29 @@ def view_products():
         st.info("No products yet.")
 
 
-    # get scanned or manual input
+def view_sales():
+    st.subheader("💰 Sales (Scan or search)")
+
+    # start the camera scanner (uses the Scanner VideoTransformer)
+    webrtc_ctx = webrtc_streamer(
+        key="scanner",
+        mode=WebRtcMode.SENDRECV,
+        video_transformer_factory=Scanner,
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        media_stream_constraints={"video": {"facingMode": {"exact": "environment"}}, "audio": False},
+        async_transform=True,
+        desired_playing_state=True,
+    )
+    st.caption("Tip: Align the barcode inside the box. Border turns green when detected.")
+
+    # read a recent scanned value (only if it happened in the last 3 seconds)
     scanned = None
     if webrtc_ctx and webrtc_ctx.video_transformer:
         vt = webrtc_ctx.video_transformer
-        if vt.last_data and vt.last_when and datetime.utcnow() - vt.last_when <= timedelta(seconds=3.0):
+        if getattr(vt, "last_data", None) and getattr(vt, "last_when", None) and datetime.utcnow() - vt.last_when <= timedelta(seconds=3.0):
             scanned = vt.last_data
 
+    # UI: scanned vs manual input
     c1, c2 = st.columns([2, 3])
     with c1:
         st.markdown("**Last scanned**")
@@ -545,28 +584,60 @@ def view_products():
             st.info("Waiting for scan…")
 
     with c2:
-        manual = st.text_input("Or enter barcode manually", placeholder="Type or paste code…")
+        manual = st.text_input("Or enter barcode manually", placeholder="Type or paste code…", key="manual_barcode_input")
 
-    # priority: scanned > manual
+    # Choose which code to use (scanned preferred)
     code_to_use = scanned or (manual.strip() if manual else None)
 
-    if code_to_use:
+    if not code_to_use:
+        st.info("Scan a barcode with your camera or enter it manually to load product.")
+        return
+
+    # Look up product safely
+    prod = None
+    try:
         prod = get_product_by_barcode(code_to_use)
-        if prod:
-            pid, pname, price, stock = prod
-            st.markdown(f"**Product:** {pname} · **Price:** {price:.2f} PKR · **Stock:** {stock}")
-            qty = st.number_input("Quantity", min_value=1, max_value=max(1, int(stock)), step=1, key=f"qty_{pid}")
-            if st.button("Confirm Sale", key=f"sale_{pid}"):
-                ok, info = log_sale(pid, int(qty), st.session_state.user_id)
-                if ok:
-                    name, q, unit, total = info
-                    st.success(f"Sale logged — total {total:.2f} PKR")
-                    st.info(f"🧾 Receipt: {name} × {q} @ {unit:.2f} = {total:.2f} PKR")
-                    st.rerun()
-                else:
-                    st.error(info)
+    except Exception as e:
+        st.error(f"Lookup failed: {e}")
+        return
+
+    if not prod:
+        st.warning("⚠️ Code not found in products.")
+        # show quick add product hint
+        if st.button("Add new product with this barcode", key=f"addprod_{code_to_use}"):
+            st.session_state.prefill_barcode = code_to_use
+            st.info("Go to Products → Add new product (barcode prefilled).")
+        return
+
+    pid, pname, price, stock = prod
+    st.markdown(f"**Product:** {pname} · **Price:** {price:.2f} PKR · **Stock:** {stock}")
+
+    # ensure stock is an int >= 0
+    try:
+        max_qty = max(1, int(stock))
+    except Exception:
+        max_qty = 1
+
+    # unique keys ensure no Streamlit collisions when repeated scans occur
+    qty_key = f"qty_{pid}_{code_to_use}"
+    sale_key = f"sale_{pid}_{code_to_use}"
+
+    qty = st.number_input("Quantity", min_value=1, max_value=max_qty, step=1, value=1, key=qty_key)
+
+    if st.button("Confirm Sale", key=sale_key):
+        ok, info = log_sale(pid, int(qty), st.session_state.user_id)
+        if ok:
+            name, q, unit, total = info
+            st.success(f"Sale logged — total {total:.2f} PKR")
+            st.info(f"🧾 Receipt: {name} × {q} @ {unit:.2f} = {total:.2f} PKR")
+            # clear manual input to avoid double-selling accidentally
+            try:
+                st.session_state["manual_barcode_input"] = ""
+            except Exception:
+                pass
+            st.experimental_rerun()
         else:
-            st.warning("Code not found in products.")
+            st.error(info)
 
 
 def view_dashboard():
@@ -577,7 +648,7 @@ def view_dashboard():
     end = colB.date_input("End date", value=today)
 
     products_df = get_products()
-    sel = st.selectbox("Filter by product", ["All"] + [f"{r['id']} — {r['name']}" for _, r in products_df.iterrows()])
+    sel = st.selectbox("Filter by product", ["All"] + [f"{r['id']} — {r['name']}" for _, r in products_df.iterrows()], key="dashboard_product_filter")
     pid = None if sel == "All" else int(sel.split(" — ")[0])
 
     df_sales = get_sales_df(start.isoformat(), end.isoformat(), pid)
