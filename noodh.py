@@ -318,58 +318,30 @@ def get_sales_df(start=None, end=None, product_id=None) -> pd.DataFrame:
 
 
 # ---------------------- SCANNER (VideoTransformerBase) ----------------------
-class Scanner(VideoTransformerBase):
+class BarcodeScanner(VideoTransformerBase):
     def __init__(self):
         self.last_data = None
         self.last_when = None
-        self.ok = False
-        self._last_scan_time = datetime.utcnow()
 
     def transform(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        h, w = img.shape[:2]
 
-        # scan box sized relative to frame
-        box = int(min(h, w) * 0.62)
-        x1, y1 = (w - box) // 2, (h - box) // 2
-        x2, y2 = x1 + box, y1 + box
-        roi = img[y1:y2, x1:x2]
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            barcodes = pyzbar.decode(gray)
+        except Exception as e:
+            barcodes = []
 
-        # throttle decoding to every 0.5s for optimization
-        now = datetime.utcnow()
-        if (now - self._last_scan_time).total_seconds() >= 0.5:
-            barcodes = pyzbar.decode(roi)
-            self.ok = bool(barcodes)
-            if self.ok:
-                # pick first barcode value
-                try:
-                    self.last_data = barcodes[0].data.decode("utf-8")
-                except Exception:
-                    self.last_data = str(barcodes[0].data)
-                self.last_when = now
-            self._last_scan_time = now
+        for barcode in barcodes:
+            x, y, w, h = barcode.rect
+            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        # border color
-        color = (0, 200, 0) if self.ok else (0, 0, 200)
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
+            barcode_data = barcode.data.decode("utf-8")
+            self.last_data = barcode_data
+            self.last_when = datetime.utcnow()
 
-        # corner accents
-        L = int(box * 0.12)
-        for (xa, ya) in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
-            cv2.line(img, (xa, ya), (xa + (L if xa == x1 else -L), ya), color, 4)
-            cv2.line(img, (xa, ya), (xa, ya + (L if ya == y1 else -L)), color, 4)
-
-        # label
-        label = "Detected" if self.ok else "Align barcode in the box"
-        cv2.putText(img, label, (x1, max(30, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-        # draw bounding boxes for detected barcodes
-        barcodes = pyzbar.decode(roi)
-        for bc in barcodes:
-            pts = bc.polygon
-            if pts and len(pts) > 1:
-                pts = np.array([(p.x + x1, p.y + y1) for p in pts], dtype=np.int32)
-                cv2.polylines(img, [pts], isClosed=True, color=(0, 200, 0), thickness=2)
+            cv2.putText(img, barcode_data, (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
         return img
 
