@@ -341,9 +341,19 @@ def create_enhanced_scanner_interface(key_prefix="enhanced_scanner", show_advanc
         # Settings
         col1, col2 = st.columns(2)
         with col1:
-            auto_process = st.checkbox("🔄 Auto Process", value=True, help="Automatically process captured images")
+            auto_process = st.checkbox(
+                "🔄 Auto Process", 
+                value=True, 
+                help="Automatically process captured images",
+                key=f"{key_prefix}_auto_process"  # Fixed: Unique key
+            )
         with col2:
-            show_preview = st.checkbox("👁️ Show Preview", value=True, help="Show captured image preview")
+            show_preview = st.checkbox(
+                "👁️ Show Preview", 
+                value=True, 
+                help="Show captured image preview",
+                key=f"{key_prefix}_show_preview"  # Fixed: Unique key
+            )
         
         # Camera input with better error handling
         try:
@@ -439,7 +449,7 @@ def create_enhanced_scanner_interface(key_prefix="enhanced_scanner", show_advanc
                                         with col_a:
                                             st.text(f"{i+1}. {det['data']} ({det['type']})")
                                         with col_b:
-                                            if st.button("Use", key=f"use_det_{i}"):
+                                            if st.button("Use", key=f"use_det_{i}_{key_prefix}"):
                                                 result.update({
                                                     "code": det['data'],
                                                     "confidence": det['confidence'],
