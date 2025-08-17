@@ -3,7 +3,6 @@ streamlit==1.34.0
 numpy==1.26.4
 Pillow==10.3.0
 pandas==2.2.2
-sqlite3==3.45.3
 
 # Scanner Dependencies (Enhanced Features)
 opencv-python-headless==4.9.0.80
