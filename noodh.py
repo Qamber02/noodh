@@ -3,13 +3,12 @@ import os
 import sqlite3
 import secrets
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone  # Fixed: Added timezone
 
 import pandas as pd
 import streamlit as st
 
 # Import our enhanced scanner
-# FIX: Changed from enhanced_scanner to scanner
 from scanner import create_enhanced_scanner_interface, create_scanner_settings_panel
 
 # ---------------------- CONFIG ----------------------
@@ -211,9 +210,10 @@ def create_user(username: str, password: str, role: str = "admin"):
     try:
         conn = get_connection()
         c = conn.cursor()
+        # Fixed: Use timezone-aware datetime
         c.execute(
             "INSERT INTO users (username, password_hash, salt, role, created_at) VALUES (?, ?, ?, ?, ?)",
-            (username, hashed, salt, role, datetime.utcnow().isoformat()),
+            (username, hashed, salt, role, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
         invalidate_caches()
@@ -320,11 +320,13 @@ def log_sale(product_id: int, qty: int, user_id: int, channel: str = "retail",
     c.execute("UPDATE products SET stock=? WHERE id=?", (new_stock, product_id))
     
     # Log transaction
+    # Fixed: Use timezone-aware datetime
     c.execute("""
         INSERT INTO sales (product_id, quantity, unit_price, total_price_pkr, channel, 
                           sale_time, user_id, transaction_type, original_sale_id, return_reason)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (product_id, int(qty), unit_price, total, channel, datetime.utcnow().isoformat(), 
+    """, (product_id, int(qty), unit_price, total, channel, 
+          datetime.now(timezone.utc).isoformat(), 
           user_id, transaction_type, original_sale_id, return_reason))
     
     conn.commit()
@@ -334,7 +336,8 @@ def log_sale(product_id: int, qty: int, user_id: int, channel: str = "retail",
 def get_sales_for_returns(days_back: int = 30) -> pd.DataFrame:
     """Get recent sales that can be returned"""
     conn = get_connection()
-    cutoff_date = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
+    # Fixed: Use timezone-aware datetime
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
     
     df = pd.read_sql_query("""
         SELECT s.id, p.name AS product_name, p.barcode, s.quantity, 
@@ -1101,7 +1104,8 @@ def main():
         if st.session_state.role == "admin":
             menu_options.append("⚙️ Settings")
         
-        selected_page = st.radio("", menu_options, index=0)
+        # Fixed: Removed empty label warning
+        selected_page = st.radio("", menu_options, index=0, label_visibility="collapsed")
     
     # Enhanced scanner settings in sidebar
     st.sidebar.markdown("---")
