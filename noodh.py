@@ -3,7 +3,7 @@ import os
 import sqlite3
 import secrets
 import hashlib
-from datetime import datetime, timedelta, timezone  # Fixed: Added timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -12,24 +12,65 @@ import streamlit as st
 from scanner import create_enhanced_scanner_interface, create_scanner_settings_panel
 
 # ---------------------- CONFIG ----------------------
-st.set_page_config(page_title="NOODH Admin POS", layout="wide")
+st.set_page_config(
+    page_title="NOODH Admin POS", 
+    layout="wide",
+    page_icon="🛒"
+)
 
 DB_PATH = "noodh.db"
 
 st.markdown(
     """
 <style>
-:root{--card-bg:#ffffff;--muted:#fafafa;--border:#e5e7eb;--radius:14px;}
+:root {
+    --primary: #4f46e5;
+    --primary-dark: #4338ca;
+    --secondary: #f9fafb;
+    --text: #1f2937;
+    --text-light: #6b7280;
+    --border: #e5e7eb;
+    --radius: 12px;
+    --shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
+}
+
 .block-container {max-width: 1200px;}
 h1, h2, h3 { font-weight: 700; }
-.card {border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; background: var(--card-bg); margin-bottom: 16px;}
-.stButton>button { border-radius: 10px; padding: 0.5rem 1rem; }
-.kpi {padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--muted);text-align:center}
+.card {border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; background: white; margin-bottom: 16px; box-shadow: var(--shadow);}
+.stButton>button {
+    background-color: var(--primary);
+    color: white;
+    border-radius: var(--radius);
+    border: none;
+    padding: 0.5rem 1rem;
+    font-weight: 500;
+    transition: all 0.2s;
+}
+.stButton>button:hover {
+    background-color: var(--primary-dark);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow);
+}
+.stButton>button:active {
+    transform: translateY(0);
+}
+.kpi {padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--secondary);text-align:center}
 .badge {padding:4px 8px;border:1px solid var(--border);border-radius:999px;background:#f8fafc;font-size:12px}
 .row {display:flex; gap:12px; align-items:center; flex-wrap:wrap}
 .success-box {background: #f0f9ff; border: 1px solid #7dd3fc; border-radius: 8px; padding: 12px; margin: 8px 0;}
 .warning-box {background: #fffbeb; border: 1px solid #fbbf24; border-radius: 8px; padding: 12px; margin: 8px 0;}
 .error-box {background: #fef2f2; border: 1px solid #f87171; border-radius: 8px; padding: 12px; margin: 8px 0;}
+.stTabs [data-baseweb="tab-list"] { gap: 8px; }
+.stTabs [data-baseweb="tab"] { 
+    border-radius: var(--radius) !important;
+    padding: 8px 16px !important;
+    background: var(--secondary) !important;
+    transition: all 0.2s;
+}
+.stTabs [aria-selected="true"] { 
+    background: var(--primary) !important;
+    color: white !important;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -247,8 +288,6 @@ def users_count() -> int:
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM users")
     return cur.fetchone()[0]
-
-# ... rest of the code remains unchanged ...
 
 # ---------------------- PRODUCTS & SALES ----------------------
 def get_products(search: str = "") -> pd.DataFrame:
@@ -480,7 +519,7 @@ def view_sales_and_returns():
                         st.success("✅ Barcode saved! Switch to Products tab to add this item.")
                 
                 with col2:
-                    if st.button("🔍 Search Again", key="search_again"):
+                    if st.button("🔍 Scan Again", key="scan_again"):
                         st.rerun()
                 return
             
@@ -546,7 +585,7 @@ def view_sales_and_returns():
                     success, result = log_sale(prod['id'], 1, st.session_state.user_id, channel)
                     if success:
                         name, qty, unit_p, total, ch, trans_type = result
-                        st.success(f"✅ Quick sale completed!")
+                        st.success(f"✅ Quick sale completed! Stock updated: {prod['stock']-1}")
                         st.balloons()
                         st.rerun()
                     else:
@@ -1100,7 +1139,8 @@ def main():
         """, unsafe_allow_html=True)
         
         if st.button("🚪 Logout", type="secondary"):
-            st.session_state.clear()
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
             st.rerun()
         
         st.markdown("---")
