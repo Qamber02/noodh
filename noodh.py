@@ -9,7 +9,8 @@ import pandas as pd
 import streamlit as st
 
 # Import our enhanced scanner
-from enhanced_scanner import create_enhanced_scanner_interface, create_scanner_settings_panel
+# FIX: Changed from enhanced_scanner to scanner
+from scanner import create_enhanced_scanner_interface, create_scanner_settings_panel
 
 # ---------------------- CONFIG ----------------------
 st.set_page_config(page_title="NOODH Admin POS", layout="wide")
@@ -268,6 +269,7 @@ def add_product(name: str, barcode: str, price: float, stock: int,
                 retail_price: float = None, wholesale_price: float = None):
     if not name.strip() or not barcode.strip():
         return False, "All fields are required."
+    # FIX: Handle None prices
     retail_price = float(retail_price if retail_price is not None else price)
     wholesale_price = float(wholesale_price if wholesale_price is not None else price)
     try:
@@ -492,7 +494,7 @@ def view_sales_and_returns():
             col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
             
             with col1:
-                channel = st.radio("Price Type", ["retail", "wholesale"], key=f"channel_{code}")
+                channel = st.radio("Price Type", ["retail", "wholesale"], key=f"channel_{code}", horizontal=True)
             
             with col2:
                 quantity = st.number_input(
@@ -505,7 +507,10 @@ def view_sales_and_returns():
                     help=f"Available stock: {prod['stock']}"
                 )
             
+            # FIX: Handle missing retail/wholesale prices
             unit_price = prod['retail_price'] if channel == 'retail' else prod['wholesale_price']
+            if not unit_price:
+                unit_price = prod['retail_price'] or prod['wholesale_price'] or 0.0
             total_price = unit_price * quantity
             
             with col3:
@@ -516,7 +521,7 @@ def view_sales_and_returns():
             
             # Enhanced sale buttons with better UX
             st.markdown("#### 💳 Process Sale")
-            col_a, col_b, col_c = st.columns([2, 2, 2])
+            col_a, col_b, col_c = st.columns(3)
             
             with col_a:
                 quick_sell_disabled = prod['stock'] < 1
@@ -555,8 +560,18 @@ def view_sales_and_returns():
             with col_c:
                 if st.button("🔄 Scan Another", key=f"scan_another_{code}", help="Clear and scan next item"):
                     # Clear the scanner state
-                    if f"sales_scanner_enhanced_scanner" in st.session_state:
-                        del st.session_state[f"sales_scanner_enhanced_scanner"]
+                    prefix = "sales_scanner"
+                    keys_to_clear = [
+                        f"{prefix}_scanner",
+                        f"{prefix}_camera",
+                        f"{prefix}_upload",
+                        f"{prefix}_manual",
+                        f"{prefix}_process",
+                        f"{prefix}_validate_manual"
+                    ]
+                    for key in keys_to_clear:
+                        if key in st.session_state:
+                            del st.session_state[key]
                     st.rerun()
         else:
             # Enhanced empty state with tips
@@ -866,6 +881,10 @@ def view_dashboard():
     total_return_orders = len(returns_only)
     total_items_sold = sales_only['quantity'].sum() if not sales_only.empty else 0
     
+    # FIX: Handle division by zero
+    return_rate = (total_return_orders / total_orders * 100) if total_orders > 0 else 0
+    avg_order_value = (total_sales / total_orders) if total_orders > 0 else 0
+    
     # Enhanced KPI display
     st.markdown("#### 📈 Key Performance Indicators")
     kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
@@ -877,10 +896,8 @@ def view_dashboard():
     with kpi3:
         st.metric("Net Revenue", f"{net_revenue:,.2f} PKR", help="Sales minus returns")
     with kpi4:
-        return_rate = (total_return_orders / total_orders * 100) if total_orders > 0 else 0
         st.metric("Return Rate", f"{return_rate:.1f}%", help="Percentage of orders returned")
     with kpi5:
-        avg_order_value = (total_sales / total_orders) if total_orders > 0 else 0
         st.metric("Avg Order Value", f"{avg_order_value:.2f} PKR", help="Average sale amount")
     
     # Additional metrics row
