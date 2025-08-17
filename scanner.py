@@ -354,13 +354,15 @@ def create_enhanced_scanner_interface(key_prefix="enhanced_scanner", show_advanc
             )
             
             if camera_input is not None:
+                # FIX: Use getvalue() instead of read() to avoid UnsupportedOperation
+                image_bytes = camera_input.getvalue()
                 if show_preview:
-                    st.image(camera_input, caption="Captured Image", width=300)
+                    st.image(image_bytes, caption="Captured Image", width=300)
                 
                 if auto_process:
                     with st.spinner("🔍 Processing image..."):
                         try:
-                            detections = scanner.scan_from_bytes(camera_input.read())
+                            detections = scanner.scan_from_bytes(image_bytes)
                             
                             if detections:
                                 best_detection = detections[0]
@@ -403,15 +405,17 @@ def create_enhanced_scanner_interface(key_prefix="enhanced_scanner", show_advanc
         )
         
         if uploaded_file is not None:
+            # FIX: Read bytes once and reuse
+            image_bytes = uploaded_file.read()
             col1, col2 = st.columns([1, 2])
             
             with col1:
-                st.image(uploaded_file, caption="Uploaded Image", width=200)
+                st.image(image_bytes, caption="Uploaded Image", width=200)
             
             with col2:
                 try:
                     with st.spinner("🤖 Processing uploaded image..."):
-                        detections = scanner.scan_from_bytes(uploaded_file.read())
+                        detections = scanner.scan_from_bytes(image_bytes)
                         
                         if detections:
                             best_detection = detections[0]
