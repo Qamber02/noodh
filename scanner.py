@@ -364,12 +364,16 @@ def create_enhanced_scanner_interface(key_prefix="enhanced_scanner", show_advanc
             )
             
             if camera_input is not None:
-                # FIX: Use getvalue() instead of read() to avoid UnsupportedOperation
-                image_bytes = camera_input.getvalue()
+                # Store image in session state
+                st.session_state[f"{key_prefix}_camera_image"] = camera_input.getvalue()
+                
+            # Check if we have a stored image to process
+            if f"{key_prefix}_camera_image" in st.session_state:
+                image_bytes = st.session_state[f"{key_prefix}_camera_image"]
                 if show_preview:
                     st.image(image_bytes, caption="Captured Image", width=300)
                 
-                if auto_process:
+                if auto_process or st.button("🔍 Process Image", key=f"{key_prefix}_process"):
                     with st.spinner("🔍 Processing image..."):
                         try:
                             detections = scanner.scan_from_bytes(image_bytes)
@@ -388,16 +392,15 @@ def create_enhanced_scanner_interface(key_prefix="enhanced_scanner", show_advanc
                                 st.success(f"{confidence_emoji} **Detected:** `{best_detection['data']}`")
                                 st.caption(f"Type: {best_detection['type']} | Confidence: {best_detection['confidence']:.1%}")
                                 
+                                # Clear image after successful scan
+                                del st.session_state[f"{key_prefix}_camera_image"]
+                                st.rerun()
                             else:
                                 st.warning("❌ No barcode detected")
                                 st.info("💡 **Tips:** Ensure good lighting, hold steady, clean barcode surface")
                         
                         except Exception as e:
                             st.error(f"Processing error: {str(e)}")
-                else:
-                    if st.button("🔍 Process Image", key=f"{key_prefix}_process"):
-                        # Manual processing trigger
-                        st.rerun()
         
         except Exception as e:
             st.error(f"Camera not available: {str(e)}")
@@ -415,7 +418,7 @@ def create_enhanced_scanner_interface(key_prefix="enhanced_scanner", show_advanc
         )
         
         if uploaded_file is not None:
-            # FIX: Read bytes once and reuse
+            # Read bytes once and reuse
             image_bytes = uploaded_file.read()
             col1, col2 = st.columns([1, 2])
             
