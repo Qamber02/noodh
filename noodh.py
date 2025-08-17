@@ -162,7 +162,7 @@ def get_setting_bool(key: str, default=False):
         return default
     return str(v) == "1"
 
-# ---------------------- AUTH (simplified for demo) ----------------------
+# ---------------------- AUTH (FIXED PASSWORD VERIFICATION) ----------------------
 try:
     import bcrypt
 
@@ -183,17 +183,17 @@ except Exception:
         dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000)
         return dk.hex(), salt
 
-    def _verify_password(password: str, hashed: str) -> bool:
+    # FIXED: Use the actual salt from database, not part of the hash
+    def _verify_password(password: str, hashed: str, salt: str) -> bool:
         try:
-            if len(hashed) == 64:
-                test = hashlib.pbkdf2_hmac(
-                    "sha256",
-                    password.encode("utf-8"),
-                    bytes.fromhex(hashed[:32]) if len(hashed) >= 32 else b"",
-                    200_000,
-                )
-                return test.hex() == hashed
-            return False
+            # Use the salt from the database to compute the hash
+            test = hashlib.pbkdf2_hmac(
+                "sha256",
+                password.encode("utf-8"),
+                bytes.fromhex(salt),
+                200_000,
+            )
+            return test.hex() == hashed
         except Exception:
             return False
 
@@ -230,7 +230,14 @@ def authenticate(username: str, password: str):
     if not row:
         return None, None
     uid, stored_hash, salt, role = row["id"], row["password_hash"], row["salt"], row["role"]
-    ok = _verify_password(password, stored_hash)
+    
+    # FIXED: Pass salt to verify function when bcrypt not available
+    try:
+        import bcrypt
+        ok = _verify_password(password, stored_hash)
+    except ImportError:
+        ok = _verify_password(password, stored_hash, salt)
+    
     if ok:
         return uid, role
     return None, None
@@ -240,6 +247,8 @@ def users_count() -> int:
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM users")
     return cur.fetchone()[0]
+
+# ... rest of the code remains unchanged ...
 
 # ---------------------- PRODUCTS & SALES ----------------------
 def get_products(search: str = "") -> pd.DataFrame:
