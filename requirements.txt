@@ -1,10 +1,8 @@
-streamlit==1.48.1
-numpy==1.26.4
-Pillow==10.1.0
-pandas==2.2.2
-opencv-python-headless==4.9.0.80
-pyzbar==0.1.9
-python-barcode==0.15.1
-bcrypt==4.1.2
-cryptography==42.0.5
-altair==5.3.0
+streamlit
+pandas
+numpy
+Pillow
+pyzbar
+opencv-python-headless
+protobuf<4.0.0  # Fixes protobuf version conflict
+sqlalchemy
