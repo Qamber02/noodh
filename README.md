@@ -2,7 +2,7 @@
 
 A modern Point of Sale system built with Streamlit, featuring advanced barcode scanning, product management, sales tracking, and return processing.
 
-## 🚀 Features
+##  Features
 
 ### ✨ New Features Added
 - **Optimized Scanner Module**: Separate, high-performance barcode scanner with multiple detection methods
