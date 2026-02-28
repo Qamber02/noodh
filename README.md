@@ -4,7 +4,7 @@ A modern Point of Sale system built with Streamlit, featuring advanced barcode s
 
 ##  Features
 
-### ✨ New Features Added
+###  New Features Added
 - **Optimized Scanner Module**: Separate, high-performance barcode scanner with multiple detection methods
 - **Return Processing**: Complete return workflow with reason tracking
 - **Enhanced UI**: Modern interface with better visual feedback
