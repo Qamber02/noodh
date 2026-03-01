@@ -11,7 +11,7 @@ A modern Point of Sale system built with Streamlit, featuring advanced barcode s
 - **Transaction Types**: Support for both sales and returns
 - **Improved Camera Support**: Multiple scanning options (camera, upload, manual)
 
-### 🛍️ Core Features
+###  Core Features
 - **Multi-channel Pricing**: Retail and wholesale pricing support
 - **Real-time Inventory**: Automatic stock management
 - **User Management**: Role-based access (admin/staff)
