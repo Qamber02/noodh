@@ -94,7 +94,7 @@ The enhanced scanner provides three methods:
 - Export transaction data to CSV
 - Monitor return rates and top products
 
-## 🏗️ Architecture
+## Architecture
 
 ### File Structure
 ```
