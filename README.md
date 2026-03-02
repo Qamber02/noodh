@@ -19,7 +19,7 @@ A modern Point of Sale system built with Streamlit, featuring advanced barcode s
 - **Data Export**: CSV export functionality
 - **Secure Authentication**: BCrypt password hashing
 
-## 📋 Prerequisites
+## Prerequisites
 
 - Python 3.8 or higher
 - Webcam (for barcode scanning)
