@@ -68,7 +68,7 @@ The enhanced scanner provides three methods:
    - Take a clear photo of the barcode
    - System automatically detects and decodes
 
-2. **🖼️ Upload Image**: 
+2. ** Upload Image**: 
    - Upload photos containing barcodes
    - Supports PNG, JPG, JPEG, WebP, BMP formats
 
