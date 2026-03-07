@@ -25,7 +25,7 @@ A modern Point of Sale system built with Streamlit, featuring advanced barcode s
 - Webcam (for barcode scanning)
 - Modern web browser
 
-## 🔧 Installation
+##  Installation
 
 1. **Clone or download the files**:
    ```bash
