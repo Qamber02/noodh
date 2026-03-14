@@ -63,7 +63,7 @@ A modern Point of Sale system built with Streamlit, featuring advanced barcode s
 ### Scanner Usage
 The enhanced scanner provides three methods:
 
-1. **📷 Camera Scan**: 
+1. **Camera Scan**: 
    - Choose front or back camera
    - Take a clear photo of the barcode
    - System automatically detects and decodes
