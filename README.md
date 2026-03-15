@@ -53,7 +53,7 @@ A modern Point of Sale system built with Streamlit, featuring advanced barcode s
    - Open your browser to `http://localhost:8501`
    - Create the initial admin account when prompted
 
-## 📱 Usage Guide
+## Usage Guide
 
 ### First Time Setup
 1. **Create Admin Account**: The system will prompt you to create an admin account on first run
