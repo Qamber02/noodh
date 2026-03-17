@@ -166,7 +166,7 @@ Adjust scanner behavior in the sidebar:
 - **Firefox**: Camera input supported
 - **Safari**: Limited camera features, use upload instead
 
-## 🔐 Security Features
+##  Security Features
 
 - **Password Hashing**: BCrypt with salt
 - **Role-based Access**: Admin and staff roles
