@@ -137,7 +137,7 @@ noodh-pos/
    - Better caching strategies
    - Streamlined scanning process
 
-## 🔧 Configuration
+##  Configuration
 
 ### Scanner Settings
 Adjust scanner behavior in the sidebar:
