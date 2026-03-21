@@ -1,4 +1,4 @@
-# enhanced_scanner.py - Optimized Scanner Module for NOODH POS (Fixed Version)
+# enhanced_scanner.py - Optimized Scanner Module for NOODH POS 
 import streamlit as st
 import numpy as np
 from datetime import datetime, timedelta
