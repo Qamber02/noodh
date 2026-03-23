@@ -180,7 +180,7 @@ Adjust scanner behavior in the sidebar:
 - **Return Analysis**: Return rates and reasons
 - **Channel Performance**: Retail vs wholesale comparison
 
-## 🚀 Future Enhancements
+## Future Enhancements
 
 Potential improvements for future versions:
 - **Multi-store Support**: Handle multiple locations
