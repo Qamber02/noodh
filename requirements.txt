@@ -4,5 +4,5 @@ numpy
 Pillow
 pyzbar
 opencv-python-headless
-protobuf<4.0.0  # Fixes protobuf version conflict
+protobuf<4.0.0  
 sqlalchemy
