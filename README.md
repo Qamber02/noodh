@@ -189,7 +189,7 @@ Potential improvements for future versions:
 - **Supplier Management**: Track purchase orders
 - **Backup Automation**: Scheduled database backups
 
-## 📞 Support
+##  Support
 
 For issues or questions:
 1. Check the troubleshooting section above
