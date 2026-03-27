@@ -197,7 +197,7 @@ For issues or questions:
 3. Ensure camera permissions are granted in browser
 4. Test with manual entry if scanner fails
 
-## 📄 License
+##  License
 
 This project is for educational and commercial use. Modify as needed for your requirements.
 
