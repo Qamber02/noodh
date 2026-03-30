@@ -173,7 +173,7 @@ Adjust scanner behavior in the sidebar:
 - **Session Management**: Secure login/logout
 - **Data Validation**: Input sanitization
 
-## 📊 Analytics Features
+## Analytics Features
 
 - **Daily Sales Trends**: Line charts of daily revenue
 - **Top Products**: Bar charts of best sellers
