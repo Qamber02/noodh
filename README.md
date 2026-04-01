@@ -149,7 +149,7 @@ Adjust scanner behavior in the sidebar:
 - **Low Stock Threshold**: Set inventory alerts
 - **Return Window**: Days allowed for returns (configurable in code)
 
-## 🐛 Troubleshooting
+##  Troubleshooting
 
 ### Scanner Issues
 - **Camera not working**: Try manual entry or image upload
