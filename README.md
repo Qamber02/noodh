@@ -204,3 +204,6 @@ This project is for educational and commercial use. Modify as needed for your re
 ---
 
 **NOODH POS System** - Modern retail management made simple. 
+
+##Author 
+**Qamber**
