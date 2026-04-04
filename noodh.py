@@ -1,4 +1,4 @@
-# app.py — Enhanced NOODH Admin POS with Returns and Enhanced Scanner
+# app.py — Enhanced NOODH Admin POS 
 import os
 import sqlite3
 import secrets
