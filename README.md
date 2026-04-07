@@ -23,7 +23,7 @@ A modern Point of Sale system built with Streamlit, featuring advanced barcode s
 
 - Python 3.8 or higher
 - Webcam (for barcode scanning)
-- Modern web browser
+
 
 ##  Installation
 
