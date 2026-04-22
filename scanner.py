@@ -1,625 +1,566 @@
-# enhanced_scanner.py - Optimized Scanner Module for NOODH POS 
-import streamlit as st
-import numpy as np
-from datetime import datetime, timedelta
+# enhanced_scanner.py - Production Scanner Module for NOODH POS
+# Supports: OpenCV + pyzbar (full mode), pyzbar-only, and manual/upload fallback
+from __future__ import annotations
+
+import io
+import logging
+import re
 import time
 from collections import deque
-import io
-from PIL import Image
-import base64
-import re
+from datetime import datetime
+from typing import Any
 
-# Fallback imports with error handling
+import numpy as np
+import streamlit as st
+from PIL import Image
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
+# ── Optional dependency probes (import-time, no Streamlit side-effects) ──────
 try:
     import cv2
-    CV2_AVAILABLE = True
+    _CV2_AVAILABLE = True
 except ImportError:
-    CV2_AVAILABLE = False
-    st.warning("⚠️ OpenCV not available. Using basic image processing.")
+    _CV2_AVAILABLE = False
+    logger.warning("OpenCV not installed. Enhanced image preprocessing disabled.")
 
 try:
-    from pyzbar import pyzbar
-    PYZBAR_AVAILABLE = True
+    from pyzbar import pyzbar as _pyzbar
+    _PYZBAR_AVAILABLE = True
 except ImportError:
-    PYZBAR_AVAILABLE = False
-    st.warning("⚠️ pyzbar not available. Using pattern matching for barcode detection.")
+    _PYZBAR_AVAILABLE = False
+    logger.warning("pyzbar not installed. Image-based barcode decoding disabled.")
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+_BARCODE_PATTERNS: list[tuple[str, str, float]] = [
+    (r"^\d{13}$",                        "EAN-13",   0.95),
+    (r"^\d{12}$",                        "UPC-A",    0.95),
+    (r"^\d{8}$",                         "EAN-8",    0.95),
+    (r"^\d{6,18}$",                      "Numeric",  0.80),
+    (r"^[A-Z0-9\-\.\$\/\+\%\s]{1,43}$", "CODE-39",  0.75),
+    (r"^[\x20-\x7E]{1,48}$",            "CODE-128", 0.70),
+]
+_MIN_CODE_LEN = 4
+_CACHE_MAX_SIZE = 128
+
+
+# ── Data helpers ──────────────────────────────────────────────────────────────
+
+def _make_detection(
+    data: str,
+    code_type: str,
+    confidence: float,
+    method: str,
+    polygon: Any = None,
+    rect: Any = None,
+) -> dict[str, Any]:
+    return {
+        "data": data,
+        "type": code_type,
+        "confidence": round(confidence, 4),
+        "method": method,
+        "polygon": polygon,
+        "rect": rect,
+    }
+
+
+# ── Core scanner class ────────────────────────────────────────────────────────
 
 class EnhancedBarcodeScanner:
     """
-    Enhanced barcode scanner with fallback modes for different deployment environments
+    Production-grade barcode scanner with graceful degradation.
+
+    Modes (auto-selected at runtime):
+      1. Full   – OpenCV preprocessing + pyzbar decoding
+      2. Basic  – pyzbar decoding only
+      3. Manual – Pattern validation only (no image decoding)
     """
-    
-    def __init__(self, debounce_time=1.5, max_results=10, confidence_threshold=0.7):
+
+    def __init__(
+        self,
+        debounce_time: float = 1.5,
+        max_history: int = 50,
+        confidence_threshold: float = 0.70,
+    ) -> None:
+        if not 0.0 < confidence_threshold <= 1.0:
+            raise ValueError("confidence_threshold must be in (0, 1]")
+
         self.debounce_time = debounce_time
-        self.max_results = max_results
         self.confidence_threshold = confidence_threshold
-        self.last_results = deque(maxlen=max_results)
-        self.last_scan_time = {}
-        self.processing = False
-        self.scan_history = deque(maxlen=50)
-        
-        # Simplified cache for fallback mode
-        self.simple_cache = {}
-        self.cache_max_size = 10
-        
-    def validate_barcode_pattern(self, code_data):
-        """Validate barcode using pattern matching (fallback method)"""
-        if not code_data or len(code_data.strip()) < 4:
-            return False, 0.0, "Unknown"
-        
-        code = code_data.strip()
-        confidence = 0.5
-        barcode_type = "Unknown"
-        
-        # EAN/UPC patterns
-        if re.match(r'^\d{13}$', code):
-            barcode_type = "EAN13"
-            confidence = 0.9
-        elif re.match(r'^\d{12}$', code):
-            barcode_type = "UPCA"
-            confidence = 0.9
-        elif re.match(r'^\d{8}$', code):
-            barcode_type = "EAN8"
-            confidence = 0.9
-        elif re.match(r'^\d{6,18}$', code):
-            barcode_type = "Numeric"
-            confidence = 0.8
-        elif re.match(r'^[A-Z0-9\-\.\$\/\+\%\s]{1,43}$', code):
-            barcode_type = "CODE39"
-            confidence = 0.7
-        elif re.match(r'^[\x00-\x7F]{1,48}$', code):
-            barcode_type = "CODE128"
-            confidence = 0.7
-        elif len(code) >= 4:
-            barcode_type = "Generic"
-            confidence = 0.6
-        
-        # Additional validation
-        if code.isdigit() and len(code) >= 8:
-            confidence += 0.1
-        
-        return confidence >= self.confidence_threshold, confidence, barcode_type
-    
-    def enhanced_image_scan(self, image):
-        """Enhanced scanning with OpenCV (when available)"""
-        if not CV2_AVAILABLE or not PYZBAR_AVAILABLE:
-            return []
-        
-        try:
-            # Convert PIL to CV2 if needed
-            if isinstance(image, Image.Image):
-                image = np.array(image)
-            
-            if len(image.shape) == 3:
-                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-            else:
-                gray = image
-            
-            # Multiple enhancement methods
-            enhanced_images = [gray]
-            
-            # Gaussian blur
-            try:
-                blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-                enhanced_images.append(blurred)
-            except:
-                pass
-            
-            # Adaptive threshold
-            try:
-                adaptive = cv2.adaptiveThreshold(
-                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-                )
-                enhanced_images.append(adaptive)
-            except:
-                pass
-            
-            # OTSU threshold
-            try:
-                _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                enhanced_images.append(otsu)
-            except:
-                pass
-            
-            all_detections = []
-            
-            for i, img in enumerate(enhanced_images):
-                try:
-                    codes = pyzbar.decode(img)
-                    for code in codes:
-                        try:
-                            decoded_data = code.data.decode('utf-8').strip()
-                            is_valid, confidence, code_type = self.validate_barcode_pattern(decoded_data)
-                            
-                            if is_valid:
-                                detection = {
-                                    'data': decoded_data,
-                                    'type': code_type,
-                                    'confidence': confidence,
-                                    'method': f'cv2_enhanced_{i}',
-                                    'polygon': getattr(code, 'polygon', None),
-                                    'rect': getattr(code, 'rect', None)
-                                }
-                                all_detections.append(detection)
-                        except (UnicodeDecodeError, AttributeError):
-                            continue
-                except Exception:
-                    continue
-            
-            # Remove duplicates and sort by confidence
-            unique_detections = {}
-            for detection in all_detections:
-                data = detection['data']
-                if data not in unique_detections or detection['confidence'] > unique_detections[data]['confidence']:
-                    unique_detections[data] = detection
-            
-            return sorted(unique_detections.values(), key=lambda x: x['confidence'], reverse=True)
-            
-        except Exception as e:
-            st.error(f"Enhanced scanning error: {str(e)}")
-            return []
-    
-    def fallback_image_scan(self, image):
-        """Fallback scanning method using basic pattern recognition"""
-        # This is a simplified fallback - in reality, you'd need more sophisticated
-        # pattern matching or integration with a web-based barcode API
-        
-        # Convert image to text using basic OCR-like approach (simplified)
-        # In a real implementation, you might use pytesseract or a web API
-        
-        return []  # Placeholder for fallback method
-    
-    def scan_image(self, image):
-        """Main scanning function with fallback support"""
-        if self.processing:
-            return []
-        
-        self.processing = True
-        
-        try:
-            # Try enhanced scanning first
-            if CV2_AVAILABLE and PYZBAR_AVAILABLE:
-                detections = self.enhanced_image_scan(image)
-            else:
-                # Use fallback method
-                detections = self.fallback_image_scan(image)
-            
-            # Apply debouncing
-            current_time = datetime.now()
-            valid_results = []
-            
-            for detection in detections:
-                code = detection['data']
-                last_time = self.last_scan_time.get(code, datetime.min)
-                
-                if (current_time - last_time).total_seconds() >= self.debounce_time:
-                    self.last_scan_time[code] = current_time
-                    valid_results.append(detection)
-                    
-                    # Add to scan history
-                    self.scan_history.append({
-                        'code': code,
-                        'timestamp': current_time,
-                        'confidence': detection['confidence'],
-                        'type': detection['type']
-                    })
-            
-            return valid_results
-            
-        except Exception as e:
-            st.error(f"Scanning error: {str(e)}")
-            return []
-        finally:
-            self.processing = False
-    
-    def scan_from_bytes(self, image_bytes):
-        """Scan barcode from image bytes with comprehensive error handling"""
-        try:
-            # Convert bytes to PIL Image
-            image = Image.open(io.BytesIO(image_bytes))
-            
-            # Convert to RGB if needed
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            
-            return self.scan_image(image)
-            
-        except Exception as e:
-            st.error(f"Error processing image: {str(e)}")
-            return []
-    
-    def validate_manual_code(self, code):
-        """Validate manually entered barcode"""
-        is_valid, confidence, barcode_type = self.validate_barcode_pattern(code)
-        
-        if is_valid:
-            return {
-                'data': code,
-                'type': barcode_type,
-                'confidence': confidence,
-                'method': 'manual_entry',
-                'polygon': None,
-                'rect': None
-            }
-        return None
-    
-    def get_scan_statistics(self):
-        """Get scanning statistics"""
-        if not self.scan_history:
-            return {}
-        
-        total_scans = len(self.scan_history)
-        avg_confidence = sum(scan['confidence'] for scan in self.scan_history) / total_scans
-        unique_codes = len(set(scan['code'] for scan in self.scan_history))
-        
+
+        self._scan_history: deque[dict] = deque(maxlen=max_history)
+        self._last_scan_time: dict[str, float] = {}
+        self._result_cache: dict[str, dict] = {}  # LRU-like via insertion order
+        self._processing = False
+
+    # ── Capability query ──────────────────────────────────────────────────────
+
+    @property
+    def mode(self) -> str:
+        if _CV2_AVAILABLE and _PYZBAR_AVAILABLE:
+            return "full"
+        if _PYZBAR_AVAILABLE:
+            return "basic"
+        return "manual"
+
+    @property
+    def capabilities(self) -> dict[str, bool]:
         return {
-            'total_scans': total_scans,
-            'unique_codes': unique_codes,
-            'average_confidence': avg_confidence,
-            'recent_scans': list(self.scan_history)[-5:],
-            'capabilities': {
-                'opencv': CV2_AVAILABLE,
-                'pyzbar': PYZBAR_AVAILABLE,
-                'enhanced_mode': CV2_AVAILABLE and PYZBAR_AVAILABLE
-            }
+            "opencv": _CV2_AVAILABLE,
+            "pyzbar": _PYZBAR_AVAILABLE,
+            "image_scan": _PYZBAR_AVAILABLE,
+            "enhanced_preprocessing": _CV2_AVAILABLE and _PYZBAR_AVAILABLE,
         }
 
-def create_scanner_guide_html():
-    """Create HTML guide for scanning"""
-    return """
-    <div style="
-        border: 2px dashed #4CAF50;
-        border-radius: 10px;
-        padding: 20px;
-        text-align: center;
-        background: linear-gradient(45deg, rgba(76, 175, 80, 0.1), rgba(76, 175, 80, 0.05));
-        margin: 10px 0;
-    ">
-        <h4 style="color: #4CAF50; margin: 0 0 10px 0;">📱 Scanning Guide</h4>
-        <div style="display: flex; justify-content: space-around; flex-wrap: wrap;">
-            <div style="margin: 5px;">
-                <strong>📸 Camera:</strong><br/>
-                <small>Good lighting, steady hands</small>
-            </div>
-            <div style="margin: 5px;">
-                <strong>🖼️ Upload:</strong><br/>
-                <small>Clear, focused images</small>
-            </div>
-            <div style="margin: 5px;">
-                <strong>⌨️ Manual:</strong><br/>
-                <small>Type or paste codes</small>
-            </div>
-        </div>
-    </div>
-    """
+    # ── Validation ────────────────────────────────────────────────────────────
 
-def create_enhanced_scanner_interface(key_prefix="enhanced_scanner", show_advanced=True):
-    """
-    Create an enhanced scanner interface with improved error handling and fallbacks
-    """
-    
-    # Initialize scanner
-    scanner_key = f"{key_prefix}_scanner"
-    if scanner_key not in st.session_state:
-        st.session_state[scanner_key] = EnhancedBarcodeScanner()
-    
-    scanner = st.session_state[scanner_key]
-    
-    st.markdown("### 📱 Enhanced Product Scanner")
-    
-    # Show capabilities
-    stats = scanner.get_scan_statistics()
-    if show_advanced and stats:
-        capabilities = stats.get('capabilities', {})
-        status_text = "🟢 Full Enhanced Mode" if capabilities.get('enhanced_mode') else "🟡 Basic Mode"
-        st.caption(f"Status: {status_text}")
-        
-        if not capabilities.get('enhanced_mode'):
-            with st.expander("ℹ️ Scanner Information"):
-                st.info("""
-                **Basic Mode Active**
-                
-                Some advanced features are not available due to missing dependencies:
-                - OpenCV: """ + ("✅" if capabilities.get('opencv') else "❌") + """
-                - pyzbar: """ + ("✅" if capabilities.get('pyzbar') else "❌") + """
-                
-                Manual entry and basic validation are still fully functional.
-                """)
-    
-    # Display scanning guide
-    st.markdown(create_scanner_guide_html(), unsafe_allow_html=True)
-    
-    # Scanning tabs
-    scan_tabs = st.tabs(["📷 Camera", "🖼️ Upload", "⌨️ Manual Entry"])
-    
-    result = {"code": None, "source": None, "confidence": 0.0, "type": None, "details": None}
-    
-    # Tab 1: Camera Scanner
-    with scan_tabs[0]:
-        st.markdown("#### 📷 Camera Scanner")
-        
-        # Settings
-        col1, col2 = st.columns(2)
-        with col1:
-            auto_process = st.checkbox(
-                "🔄 Auto Process", 
-                value=True, 
-                help="Automatically process captured images",
-                key=f"{key_prefix}_auto_process"  # Fixed: Unique key
-            )
-        with col2:
-            show_preview = st.checkbox(
-                "👁️ Show Preview", 
-                value=True, 
-                help="Show captured image preview",
-                key=f"{key_prefix}_show_preview"  # Fixed: Unique key
-            )
-        
-        # Camera input with better error handling
-        try:
-            camera_input = st.camera_input(
-                "📸 Capture barcode image",
-                key=f"{key_prefix}_camera",
-                help="Position barcode clearly in frame"
-            )
-            
-            if camera_input is not None:
-                # Store image in session state
-                st.session_state[f"{key_prefix}_camera_image"] = camera_input.getvalue()
-                
-            # Check if we have a stored image to process
-            if f"{key_prefix}_camera_image" in st.session_state:
-                image_bytes = st.session_state[f"{key_prefix}_camera_image"]
-                if show_preview:
-                    st.image(image_bytes, caption="Captured Image", width=300)
-                
-                if auto_process or st.button("🔍 Process Image", key=f"{key_prefix}_process"):
-                    with st.spinner("🔍 Processing image..."):
-                        try:
-                            detections = scanner.scan_from_bytes(image_bytes)
-                            
-                            if detections:
-                                best_detection = detections[0]
-                                result.update({
-                                    "code": best_detection['data'],
-                                    "source": "camera",
-                                    "confidence": best_detection['confidence'],
-                                    "type": best_detection['type'],
-                                    "details": best_detection
-                                })
-                                
-                                confidence_emoji = "🟢" if best_detection['confidence'] > 0.8 else "🟡" if best_detection['confidence'] > 0.6 else "🔴"
-                                st.success(f"{confidence_emoji} **Detected:** `{best_detection['data']}`")
-                                st.caption(f"Type: {best_detection['type']} | Confidence: {best_detection['confidence']:.1%}")
-                                
-                                # Clear image after successful scan
-                                del st.session_state[f"{key_prefix}_camera_image"]
-                                st.rerun()
-                            else:
-                                st.warning("❌ No barcode detected")
-                                st.info("💡 **Tips:** Ensure good lighting, hold steady, clean barcode surface")
-                        
-                        except Exception as e:
-                            st.error(f"Processing error: {str(e)}")
-        
-        except Exception as e:
-            st.error(f"Camera not available: {str(e)}")
-            st.info("📱 Camera input may not be supported in this environment. Try manual entry or file upload.")
-    
-    # Tab 2: File Upload
-    with scan_tabs[1]:
-        st.markdown("#### 🖼️ Image Upload Scanner")
-        
-        uploaded_file = st.file_uploader(
-            "Upload barcode image",
-            type=["png", "jpg", "jpeg", "webp", "bmp"],
-            key=f"{key_prefix}_upload",
-            help="Supports PNG, JPG, JPEG, WebP, BMP formats"
+    def validate_barcode_pattern(
+        self, code_data: str
+    ) -> tuple[bool, float, str]:
+        """
+        Returns (is_valid, confidence, barcode_type).
+        Validates purely by pattern; no image required.
+        """
+        code = code_data.strip() if code_data else ""
+        if len(code) < _MIN_CODE_LEN:
+            return False, 0.0, "Unknown"
+
+        for pattern, btype, base_conf in _BARCODE_PATTERNS:
+            if re.match(pattern, code):
+                # Slight boost for pure-numeric codes (less ambiguous)
+                conf = base_conf + (0.04 if code.isdigit() else 0.0)
+                conf = min(conf, 1.0)
+                return conf >= self.confidence_threshold, conf, btype
+
+        # Generic fallback
+        conf = 0.55
+        return conf >= self.confidence_threshold, conf, "Generic"
+
+    # ── Image scanning ────────────────────────────────────────────────────────
+
+    def _preprocess_variants(self, image: np.ndarray) -> list[np.ndarray]:
+        """Return a list of preprocessed grayscale variants for better decode rate."""
+        gray = (
+            cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            if image.ndim == 3
+            else image.copy()
         )
-        
-        if uploaded_file is not None:
-            # Read bytes once and reuse
-            image_bytes = uploaded_file.read()
-            col1, col2 = st.columns([1, 2])
-            
-            with col1:
-                st.image(image_bytes, caption="Uploaded Image", width=200)
-            
-            with col2:
+        variants: list[np.ndarray] = [gray]
+
+        ops = [
+            lambda g: cv2.GaussianBlur(g, (3, 3), 0),
+            lambda g: cv2.adaptiveThreshold(
+                g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+            ),
+            lambda g: cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+            lambda g: cv2.equalizeHist(g),
+        ]
+        for op in ops:
+            try:
+                variants.append(op(gray))
+            except Exception as exc:
+                logger.debug("Preprocessing op failed: %s", exc)
+
+        return variants
+
+    def _decode_with_pyzbar(self, images: list[np.ndarray]) -> list[dict]:
+        """Run pyzbar over a list of images; return deduplicated detections."""
+        seen: dict[str, dict] = {}
+        for idx, img in enumerate(images):
+            try:
+                codes = _pyzbar.decode(img)
+            except Exception as exc:
+                logger.debug("pyzbar decode error on variant %d: %s", idx, exc)
+                continue
+
+            for code in codes:
                 try:
-                    with st.spinner("🤖 Processing uploaded image..."):
-                        detections = scanner.scan_from_bytes(image_bytes)
-                        
-                        if detections:
-                            best_detection = detections[0]
-                            result.update({
-                                "code": best_detection['data'],
-                                "source": "upload",
-                                "confidence": best_detection['confidence'],
-                                "type": best_detection['type'],
-                                "details": best_detection
-                            })
-                            
-                            st.success("✅ **Barcode Found!**")
-                            st.code(best_detection['data'])
-                            st.caption(f"Type: {best_detection['type']} | Confidence: {best_detection['confidence']:.1%}")
-                            
-                            # Show multiple detections if found
-                            if len(detections) > 1:
-                                with st.expander(f"📋 Found {len(detections)} barcodes"):
-                                    for i, det in enumerate(detections):
-                                        col_a, col_b = st.columns([3, 1])
-                                        with col_a:
-                                            st.text(f"{i+1}. {det['data']} ({det['type']})")
-                                        with col_b:
-                                            if st.button("Use", key=f"use_det_{i}_{key_prefix}"):
-                                                result.update({
-                                                    "code": det['data'],
-                                                    "confidence": det['confidence'],
-                                                    "type": det['type'],
-                                                    "details": det
-                                                })
-                                                st.rerun()
-                        else:
-                            st.warning("❌ No barcode detected in uploaded image")
-                            st.info("Try uploading a clearer image or use manual entry")
-                
-                except Exception as e:
-                    st.error(f"Error processing upload: {str(e)}")
-    
-    # Tab 3: Manual Entry
-    with scan_tabs[2]:
-        st.markdown("#### ⌨️ Manual Barcode Entry")
-        
-        col1, col2 = st.columns([4, 1])
-        
-        with col1:
-            manual_code = st.text_input(
-                "Enter barcode manually",
-                placeholder="Type, paste, or use barcode scanner...",
-                key=f"{key_prefix}_manual",
-                help="Supports keyboard wedge scanners and manual typing"
+                    raw = code.data.decode("utf-8").strip()
+                except (UnicodeDecodeError, AttributeError):
+                    continue
+
+                is_valid, conf, btype = self.validate_barcode_pattern(raw)
+                if not is_valid:
+                    continue
+
+                method = "pyzbar_cv2" if _CV2_AVAILABLE else "pyzbar"
+                det = _make_detection(
+                    raw, btype, conf, f"{method}_v{idx}",
+                    getattr(code, "polygon", None),
+                    getattr(code, "rect", None),
+                )
+                if raw not in seen or det["confidence"] > seen[raw]["confidence"]:
+                    seen[raw] = det
+
+        return sorted(seen.values(), key=lambda d: d["confidence"], reverse=True)
+
+    def scan_image(self, image: Image.Image) -> list[dict]:
+        """
+        Scan a PIL Image for barcodes.
+        Returns a list of detection dicts sorted by confidence (descending).
+        """
+        if not _PYZBAR_AVAILABLE:
+            logger.warning("scan_image called but pyzbar is not available.")
+            return []
+
+        arr = np.array(image.convert("RGB"))
+
+        if _CV2_AVAILABLE:
+            variants = self._preprocess_variants(arr)
+        else:
+            gray = np.mean(arr, axis=2).astype(np.uint8) if arr.ndim == 3 else arr
+            variants = [gray]
+
+        return self._decode_with_pyzbar(variants)
+
+    def scan_from_bytes(self, image_bytes: bytes) -> list[dict]:
+        """Decode image bytes and scan for barcodes."""
+        try:
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        except Exception as exc:
+            logger.error("Failed to open image bytes: %s", exc)
+            raise ValueError(f"Cannot open image: {exc}") from exc
+        return self.scan_image(image)
+
+    # ── Manual validation ─────────────────────────────────────────────────────
+
+    def validate_manual_code(self, code: str) -> dict | None:
+        """
+        Validate a manually entered barcode string.
+        Returns a detection dict or None if invalid.
+        """
+        code = code.strip()
+        is_valid, conf, btype = self.validate_barcode_pattern(code)
+        if not is_valid:
+            return None
+        return _make_detection(code, btype, conf, "manual_entry")
+
+    # ── Debouncing ────────────────────────────────────────────────────────────
+
+    def apply_debounce(self, detections: list[dict]) -> list[dict]:
+        """Filter detections that appeared too recently."""
+        now = time.monotonic()
+        passed: list[dict] = []
+        for det in detections:
+            code = det["data"]
+            if now - self._last_scan_time.get(code, 0.0) >= self.debounce_time:
+                self._last_scan_time[code] = now
+                passed.append(det)
+                self._record_history(det)
+        return passed
+
+    def _record_history(self, det: dict) -> None:
+        self._scan_history.append({
+            "code": det["data"],
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "confidence": det["confidence"],
+            "type": det["type"],
+        })
+
+    # ── Statistics ────────────────────────────────────────────────────────────
+
+    def get_statistics(self) -> dict:
+        history = list(self._scan_history)
+        if not history:
+            return {"total_scans": 0, "capabilities": self.capabilities, "mode": self.mode}
+        return {
+            "total_scans": len(history),
+            "unique_codes": len({s["code"] for s in history}),
+            "average_confidence": round(
+                sum(s["confidence"] for s in history) / len(history), 3
+            ),
+            "recent_scans": history[-5:],
+            "capabilities": self.capabilities,
+            "mode": self.mode,
+        }
+
+    def reset_history(self) -> None:
+        self._scan_history.clear()
+        self._last_scan_time.clear()
+
+
+# ── Session-state helpers ─────────────────────────────────────────────────────
+
+def _get_scanner(key: str) -> EnhancedBarcodeScanner:
+    if key not in st.session_state:
+        st.session_state[key] = EnhancedBarcodeScanner()
+    return st.session_state[key]
+
+
+def _empty_result() -> dict:
+    return {"code": None, "source": None, "confidence": 0.0, "type": None, "details": None}
+
+
+# ── UI components ─────────────────────────────────────────────────────────────
+
+def _render_status_badge(scanner: EnhancedBarcodeScanner) -> None:
+    mode_labels = {
+        "full":   ("🟢", "Full Mode", "OpenCV + pyzbar active"),
+        "basic":  ("🟡", "Basic Mode", "pyzbar active, OpenCV missing"),
+        "manual": ("🔴", "Manual Only", "pyzbar & OpenCV unavailable"),
+    }
+    icon, label, detail = mode_labels[scanner.mode]
+    st.caption(f"{icon} **{label}** — {detail}")
+    if scanner.mode != "full":
+        missing = [k for k, v in scanner.capabilities.items() if not v]
+        st.info(
+            f"Missing: `{'`, `'.join(missing)}`. "
+            "Install via `pip install opencv-python pyzbar` for full scanning support."
+        )
+
+
+def _render_detection(det: dict, source: str) -> dict:
+    conf = det["confidence"]
+    emoji = "🟢" if conf > 0.85 else "🟡" if conf > 0.65 else "🔴"
+    st.success(f"{emoji} **Detected:** `{det['data']}`")
+    st.caption(f"Type: {det['type']} · Confidence: {conf:.0%} · Source: {source}")
+    return {
+        "code": det["data"],
+        "source": source,
+        "confidence": conf,
+        "type": det["type"],
+        "details": det,
+    }
+
+
+# ── Main interface ────────────────────────────────────────────────────────────
+
+def create_enhanced_scanner_interface(
+    key_prefix: str = "scanner",
+    show_advanced: bool = True,
+    debounce_time: float = 1.5,
+    confidence_threshold: float = 0.70,
+) -> dict:
+    """
+    Render the full scanner interface and return a result dict:
+      { code, source, confidence, type, details }
+    All keys are None / 0.0 if no barcode was detected this render cycle.
+    """
+    scanner_key = f"_scanner_{key_prefix}"
+    scanner: EnhancedBarcodeScanner = _get_scanner(scanner_key)
+    # Apply any externally changed settings
+    scanner.debounce_time = debounce_time
+    scanner.confidence_threshold = confidence_threshold
+
+    st.markdown("### 📱 Product Scanner")
+
+    if show_advanced:
+        _render_status_badge(scanner)
+
+    # ── Guide banner ──────────────────────────────────────────────────────────
+    st.markdown(
+        """
+        <div style="
+            border:2px dashed #22c55e;border-radius:10px;padding:16px;
+            text-align:center;background:rgba(34,197,94,.06);margin:8px 0 16px;
+            font-size:.85rem;
+        ">
+            <strong style="color:#22c55e;">Scanning Options</strong>
+            &nbsp;·&nbsp; 📷 Camera &nbsp;·&nbsp; 🖼️ Upload &nbsp;·&nbsp; ⌨️ Manual
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    result = _empty_result()
+    tab_camera, tab_upload, tab_manual = st.tabs(["📷 Camera", "🖼️ Upload", "⌨️ Manual Entry"])
+
+    # ── Camera tab ────────────────────────────────────────────────────────────
+    with tab_camera:
+        if not _PYZBAR_AVAILABLE:
+            st.warning("Image scanning unavailable. Use **Manual Entry** tab.")
+        else:
+            show_preview = st.checkbox("Show preview", value=True, key=f"{key_prefix}_cam_preview")
+
+            camera_input = st.camera_input(
+                "Capture barcode",
+                key=f"{key_prefix}_camera",
+                help="Position the barcode clearly in frame",
             )
-        
-        with col2:
-            st.markdown("<br>", unsafe_allow_html=True)
-            validate_manual = st.button("✓ Validate", key=f"{key_prefix}_validate_manual")
-        
-        if manual_code.strip() or validate_manual:
-            cleaned_code = manual_code.strip()
-            
-            if cleaned_code:
-                try:
-                    validation_result = scanner.validate_manual_code(cleaned_code)
-                    
-                    if validation_result:
-                        result.update({
-                            "code": validation_result['data'],
-                            "source": "manual",
-                            "confidence": validation_result['confidence'],
-                            "type": validation_result['type'],
-                            "details": validation_result
-                        })
-                        
-                        st.success(f"✅ **Valid Barcode:** `{cleaned_code}`")
-                        st.info(f"📊 Type: {validation_result['type']} | Confidence: {validation_result['confidence']:.1%}")
-                        
-                        # Add to scan history
-                        scanner.scan_history.append({
-                            'code': cleaned_code,
-                            'timestamp': datetime.now(),
-                            'confidence': validation_result['confidence'],
-                            'type': validation_result['type']
-                        })
+
+            if camera_input is not None:
+                if show_preview:
+                    st.image(camera_input, caption="Captured image", width=300)
+
+                with st.spinner("Scanning…"):
+                    try:
+                        detections = scanner.scan_from_bytes(camera_input.getvalue())
+                        detections = scanner.apply_debounce(detections)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                        detections = []
+
+                if detections:
+                    result = _render_detection(detections[0], "camera")
+                    if len(detections) > 1:
+                        with st.expander(f"ℹ️ {len(detections)} barcodes found"):
+                            for det in detections[1:]:
+                                st.text(f"{det['data']} ({det['type']}, {det['confidence']:.0%})")
+                else:
+                    st.warning("No barcode detected. Ensure good lighting and a steady hand.")
+
+    # ── Upload tab ────────────────────────────────────────────────────────────
+    with tab_upload:
+        if not _PYZBAR_AVAILABLE:
+            st.warning("Image scanning unavailable. Use **Manual Entry** tab.")
+        else:
+            uploaded = st.file_uploader(
+                "Upload barcode image",
+                type=["png", "jpg", "jpeg", "webp", "bmp"],
+                key=f"{key_prefix}_upload",
+            )
+
+            if uploaded is not None:
+                raw_bytes = uploaded.read()
+                col_img, col_result = st.columns([1, 2])
+
+                with col_img:
+                    st.image(raw_bytes, width=200)
+
+                with col_result:
+                    with st.spinner("Scanning…"):
+                        try:
+                            detections = scanner.scan_from_bytes(raw_bytes)
+                            detections = scanner.apply_debounce(detections)
+                        except ValueError as exc:
+                            st.error(str(exc))
+                            detections = []
+
+                    if detections:
+                        result = _render_detection(detections[0], "upload")
+                        if len(detections) > 1:
+                            with st.expander(f"ℹ️ {len(detections)} barcodes found"):
+                                for i, det in enumerate(detections[1:], start=2):
+                                    col_a, col_b = st.columns([3, 1])
+                                    with col_a:
+                                        st.text(f"{i}. {det['data']} ({det['type']})")
+                                    with col_b:
+                                        if st.button("Use", key=f"{key_prefix}_use_{i}"):
+                                            result = _render_detection(det, "upload")
                     else:
-                        st.warning("⚠️ Invalid barcode format")
-                        st.info("Check the barcode format - minimum 4 characters required")
-                
-                except Exception as e:
-                    st.error(f"Validation error: {str(e)}")
-            elif validate_manual:
-                st.warning("Please enter a barcode first")
-    
-    # Show scan history if available
-    if show_advanced and stats and stats.get('recent_scans'):
-        with st.expander("📊 Recent Scans"):
-            for scan in reversed(stats['recent_scans'][-3:]):  # Show last 3
-                col1, col2, col3 = st.columns([2, 1, 1])
-                with col1:
-                    st.code(scan['code'])
-                with col2:
-                    st.caption(scan['type'])
-                with col3:
-                    st.caption(f"{scan['confidence']:.0%}")
-    
-    # Display final result
+                        st.warning("No barcode detected. Try a clearer image or manual entry.")
+
+    # ── Manual entry tab ──────────────────────────────────────────────────────
+    with tab_manual:
+        col_input, col_btn = st.columns([4, 1])
+
+        with col_input:
+            manual_code = st.text_input(
+                "Enter barcode",
+                placeholder="Type, paste, or use a keyboard wedge scanner…",
+                key=f"{key_prefix}_manual",
+            )
+
+        with col_btn:
+            st.markdown("<br>", unsafe_allow_html=True)
+            submit = st.button("✓ Submit", key=f"{key_prefix}_manual_submit")
+
+        # Only fire on explicit submit to avoid per-keystroke validation
+        if submit:
+            code = manual_code.strip()
+            if not code:
+                st.warning("Please enter a barcode first.")
+            else:
+                validation = scanner.validate_manual_code(code)
+                if validation:
+                    scanner.apply_debounce([validation])
+                    result = _render_detection(validation, "manual")
+                else:
+                    st.error(
+                        f"Invalid barcode: `{code}` — must be ≥{_MIN_CODE_LEN} characters "
+                        "and match a recognised format."
+                    )
+
+    # ── Recent history ────────────────────────────────────────────────────────
+    if show_advanced:
+        stats = scanner.get_statistics()
+        recent = stats.get("recent_scans", [])
+        if recent:
+            with st.expander("📊 Recent Scans"):
+                for scan in reversed(recent):
+                    c1, c2, c3 = st.columns([3, 1, 1])
+                    c1.code(scan["code"])
+                    c2.caption(scan["type"])
+                    c3.caption(f"{scan['confidence']:.0%}")
+
+    # ── Result summary ────────────────────────────────────────────────────────
     if result["code"]:
-        st.markdown("---")
-        st.markdown("### 📋 Scan Result")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown(f"**Code:** `{result['code']}`")
-        with col2:
-            st.markdown(f"**Type:** {result['type'] or 'Unknown'}")
-        with col3:
-            confidence_emoji = "🟢" if result['confidence'] > 0.8 else "🟡" if result['confidence'] > 0.6 else "🔴"
-            st.markdown(f"**Quality:** {confidence_emoji} {result['confidence']:.0%}")
-    
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f"**Code** `{result['code']}`")
+        c2.markdown(f"**Type** {result['type'] or '—'}")
+        conf = result["confidence"]
+        badge = "🟢" if conf > 0.85 else "🟡" if conf > 0.65 else "🔴"
+        c3.markdown(f"**Quality** {badge} {conf:.0%}")
+
     return result
 
-def create_scanner_settings_panel():
-    """Create simplified scanner settings panel"""
+
+# ── Sidebar settings panel ────────────────────────────────────────────────────
+
+def create_scanner_settings_panel(key_prefix: str = "scanner_settings") -> dict:
+    """
+    Render sidebar scanner settings. Returns the settings dict.
+    Pass the returned values into create_enhanced_scanner_interface().
+    """
     with st.sidebar:
         st.markdown("### ⚙️ Scanner Settings")
-        
-        with st.expander("🎯 Basic Settings"):
-            debounce_time = st.slider(
-                "Scan Cooldown (sec)",
-                min_value=0.5,
-                max_value=5.0,
-                value=1.5,
-                step=0.1,
-                help="Time between scanning the same code"
-            )
-            
-            confidence_threshold = st.slider(
-                "Quality Threshold",
-                min_value=0.1,
-                max_value=1.0,
-                value=0.7,
-                step=0.05,
-                help="Minimum quality score"
-            )
-        
-        with st.expander("📱 Interface"):
-            show_preview = st.checkbox("Show Image Preview", value=True)
-            auto_process = st.checkbox("Auto Process Images", value=True)
-            show_tips = st.checkbox("Show Scanning Tips", value=True)
-        
-        return {
-            "debounce_time": debounce_time,
-            "confidence_threshold": confidence_threshold,
-            "show_preview": show_preview,
-            "auto_process": auto_process,
-            "show_tips": show_tips
-        }
 
-# Demo function for testing
-def demo_scanner():
-    """Demo the fixed scanner"""
-    st.set_page_config(
-        page_title="Enhanced Scanner Demo",
-        page_icon="📱",
-        layout="wide"
-    )
-    
-    st.title("📱 Enhanced Barcode Scanner")
-    st.markdown("*Fixed version with improved compatibility*")
-    
-    # Settings
+        with st.expander("🎯 Scan Quality", expanded=False):
+            debounce_time = st.slider(
+                "Scan cooldown (s)",
+                min_value=0.5, max_value=5.0, value=1.5, step=0.1,
+                help="Minimum seconds before the same code is accepted again.",
+                key=f"{key_prefix}_debounce",
+            )
+            confidence_threshold = st.slider(
+                "Min confidence",
+                min_value=0.10, max_value=1.0, value=0.70, step=0.05,
+                help="Detections below this threshold are discarded.",
+                key=f"{key_prefix}_confidence",
+            )
+
+        with st.expander("🖼️ Interface", expanded=False):
+            show_advanced = st.checkbox(
+                "Show advanced info", value=True, key=f"{key_prefix}_advanced"
+            )
+
+    return {
+        "debounce_time": debounce_time,
+        "confidence_threshold": confidence_threshold,
+        "show_advanced": show_advanced,
+    }
+
+
+# ── Standalone demo ───────────────────────────────────────────────────────────
+
+def _demo() -> None:
+    """Entry-point for running the scanner as a standalone Streamlit page."""
+    st.set_page_config(page_title="NOODH Scanner", page_icon="📱", layout="wide")
+    st.title("📱 NOODH Barcode Scanner")
+
     settings = create_scanner_settings_panel()
-    
-    # Main scanner
-    result = create_enhanced_scanner_interface("demo", show_advanced=True)
-    
-    # Actions
+
+    result = create_enhanced_scanner_interface(
+        key_prefix="demo",
+        show_advanced=settings["show_advanced"],
+        debounce_time=settings["debounce_time"],
+        confidence_threshold=settings["confidence_threshold"],
+    )
+
     if result["code"]:
+        st.divider()
         st.markdown("### 🎯 Actions")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("📋 Copy to Clipboard"):
-                st.code(result["code"])
-                st.success("Code displayed above!")
-        
-        with col2:
-            if st.button("🔍 Lookup Product"):
-                st.info(f"Searching for: {result['code']}")
-        
-        with col3:
-            if st.button("💾 Save Result"):
-                st.success("Result saved to history!")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.button("🔍 Lookup Product", key="demo_lookup")
+        with c2:
+            if st.button("🗑️ Clear History", key="demo_clear"):
+                scanner = _get_scanner("_scanner_demo")
+                scanner.reset_history()
+                st.rerun()
+
 
 if __name__ == "__main__":
-    demo_scanner()
+    _demo()
