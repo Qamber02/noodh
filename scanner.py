@@ -5,8 +5,9 @@ from __future__ import annotations
 import io
 import logging
 import re
+import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime
 from typing import Any
 
@@ -42,7 +43,17 @@ _BARCODE_PATTERNS: list[tuple[str, str, float]] = [
     (r"^[\x20-\x7E]{1,48}$",            "CODE-128", 0.70),
 ]
 _MIN_CODE_LEN = 4
+_MAX_CODE_LEN = 128          # guard against absurdly long pastes
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB upload cap
 _CACHE_MAX_SIZE = 128
+_DEBOUNCE_PRUNE_INTERVAL = 300  # seconds – prune stale debounce entries every 5 min
+
+
+# ── Pre-compiled patterns (avoid re-compiling on every call) ─────────────────
+_COMPILED_PATTERNS: list[tuple[re.Pattern, str, float]] = [
+    (re.compile(pat), btype, conf)
+    for pat, btype, conf in _BARCODE_PATTERNS
+]
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
@@ -65,6 +76,36 @@ def _make_detection(
     }
 
 
+# ── LRU cache ────────────────────────────────────────────────────────────────
+
+class _LRUCache:
+    """Thread-safe bounded LRU cache backed by OrderedDict."""
+
+    def __init__(self, maxsize: int = _CACHE_MAX_SIZE) -> None:
+        self._maxsize = maxsize
+        self._store: OrderedDict[str, dict] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> dict | None:
+        with self._lock:
+            if key not in self._store:
+                return None
+            self._store.move_to_end(key)
+            return self._store[key]
+
+    def put(self, key: str, value: dict) -> None:
+        with self._lock:
+            if key in self._store:
+                self._store.move_to_end(key)
+            self._store[key] = value
+            if len(self._store) > self._maxsize:
+                self._store.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+
+
 # ── Core scanner class ────────────────────────────────────────────────────────
 
 class EnhancedBarcodeScanner:
@@ -83,16 +124,45 @@ class EnhancedBarcodeScanner:
         max_history: int = 50,
         confidence_threshold: float = 0.70,
     ) -> None:
-        if not 0.0 < confidence_threshold <= 1.0:
-            raise ValueError("confidence_threshold must be in (0, 1]")
+        self._validate_init_args(debounce_time, confidence_threshold)
 
-        self.debounce_time = debounce_time
-        self.confidence_threshold = confidence_threshold
+        self._debounce_time = debounce_time
+        self._confidence_threshold = confidence_threshold
 
         self._scan_history: deque[dict] = deque(maxlen=max_history)
         self._last_scan_time: dict[str, float] = {}
-        self._result_cache: dict[str, dict] = {}  # LRU-like via insertion order
-        self._processing = False
+        self._last_prune_time: float = time.monotonic()
+        self._cache = _LRUCache(maxsize=_CACHE_MAX_SIZE)
+        self._lock = threading.Lock()
+
+    # ── Settings with validation ──────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_init_args(debounce_time: float, confidence_threshold: float) -> None:
+        if not isinstance(debounce_time, (int, float)) or debounce_time < 0:
+            raise ValueError("debounce_time must be a non-negative number.")
+        if not 0.0 < confidence_threshold <= 1.0:
+            raise ValueError("confidence_threshold must be in (0, 1].")
+
+    @property
+    def debounce_time(self) -> float:
+        return self._debounce_time
+
+    @debounce_time.setter
+    def debounce_time(self, value: float) -> None:
+        if not isinstance(value, (int, float)) or value < 0:
+            raise ValueError("debounce_time must be a non-negative number.")
+        self._debounce_time = value
+
+    @property
+    def confidence_threshold(self) -> float:
+        return self._confidence_threshold
+
+    @confidence_threshold.setter
+    def confidence_threshold(self, value: float) -> None:
+        if not 0.0 < value <= 1.0:
+            raise ValueError("confidence_threshold must be in (0, 1].")
+        self._confidence_threshold = value
 
     # ── Capability query ──────────────────────────────────────────────────────
 
@@ -123,24 +193,23 @@ class EnhancedBarcodeScanner:
         Validates purely by pattern; no image required.
         """
         code = code_data.strip() if code_data else ""
-        if len(code) < _MIN_CODE_LEN:
+
+        # Guard: length bounds
+        if not (_MIN_CODE_LEN <= len(code) <= _MAX_CODE_LEN):
             return False, 0.0, "Unknown"
 
-        for pattern, btype, base_conf in _BARCODE_PATTERNS:
-            if re.match(pattern, code):
-                # Slight boost for pure-numeric codes (less ambiguous)
-                conf = base_conf + (0.04 if code.isdigit() else 0.0)
-                conf = min(conf, 1.0)
-                return conf >= self.confidence_threshold, conf, btype
+        for compiled_pat, btype, base_conf in _COMPILED_PATTERNS:
+            if compiled_pat.match(code):
+                conf = min(base_conf + (0.04 if code.isdigit() else 0.0), 1.0)
+                return conf >= self._confidence_threshold, conf, btype
 
-        # Generic fallback
         conf = 0.55
-        return conf >= self.confidence_threshold, conf, "Generic"
+        return conf >= self._confidence_threshold, conf, "Generic"
 
     # ── Image scanning ────────────────────────────────────────────────────────
 
     def _preprocess_variants(self, image: np.ndarray) -> list[np.ndarray]:
-        """Return a list of preprocessed grayscale variants for better decode rate."""
+        """Return preprocessed grayscale variants for better decode rate."""
         gray = (
             cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
             if image.ndim == 3
@@ -148,19 +217,26 @@ class EnhancedBarcodeScanner:
         )
         variants: list[np.ndarray] = [gray]
 
-        ops = [
-            lambda g: cv2.GaussianBlur(g, (3, 3), 0),
-            lambda g: cv2.adaptiveThreshold(
+        # Named functions instead of lambdas — picklable and debuggable
+        def _blur(g: np.ndarray) -> np.ndarray:
+            return cv2.GaussianBlur(g, (3, 3), 0)
+
+        def _adaptive(g: np.ndarray) -> np.ndarray:
+            return cv2.adaptiveThreshold(
                 g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-            ),
-            lambda g: cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-            lambda g: cv2.equalizeHist(g),
-        ]
-        for op in ops:
+            )
+
+        def _otsu(g: np.ndarray) -> np.ndarray:
+            return cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+        def _equalize(g: np.ndarray) -> np.ndarray:
+            return cv2.equalizeHist(g)
+
+        for op in (_blur, _adaptive, _otsu, _equalize):
             try:
                 variants.append(op(gray))
             except Exception as exc:
-                logger.debug("Preprocessing op failed: %s", exc)
+                logger.debug("Preprocessing op %s failed: %s", op.__name__, exc)
 
         return variants
 
@@ -215,13 +291,32 @@ class EnhancedBarcodeScanner:
         return self._decode_with_pyzbar(variants)
 
     def scan_from_bytes(self, image_bytes: bytes) -> list[dict]:
-        """Decode image bytes and scan for barcodes."""
+        """
+        Decode image bytes and scan for barcodes.
+        Raises ValueError on oversized or unreadable input.
+        """
+        if len(image_bytes) > _MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"Image too large ({len(image_bytes) / 1_048_576:.1f} MB). "
+                f"Maximum allowed size is {_MAX_IMAGE_BYTES // 1_048_576} MB."
+            )
+
+        # Cache hit — skip re-decoding the same bytes
+        cache_key = str(hash(image_bytes))
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            logger.debug("Cache hit for image hash %s", cache_key)
+            return cached["detections"]
+
         try:
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         except Exception as exc:
             logger.error("Failed to open image bytes: %s", exc)
             raise ValueError(f"Cannot open image: {exc}") from exc
-        return self.scan_image(image)
+
+        detections = self.scan_image(image)
+        self._cache.put(cache_key, {"detections": detections})
+        return detections
 
     # ── Manual validation ─────────────────────────────────────────────────────
 
@@ -238,16 +333,30 @@ class EnhancedBarcodeScanner:
 
     # ── Debouncing ────────────────────────────────────────────────────────────
 
+    def _prune_debounce_map(self, now: float) -> None:
+        """Remove stale entries from _last_scan_time to prevent unbounded growth."""
+        if now - self._last_prune_time < _DEBOUNCE_PRUNE_INTERVAL:
+            return
+        cutoff = now - max(self._debounce_time * 2, 60.0)
+        stale = [k for k, t in self._last_scan_time.items() if t < cutoff]
+        for k in stale:
+            del self._last_scan_time[k]
+        self._last_prune_time = now
+        if stale:
+            logger.debug("Pruned %d stale debounce entries.", len(stale))
+
     def apply_debounce(self, detections: list[dict]) -> list[dict]:
         """Filter detections that appeared too recently."""
         now = time.monotonic()
-        passed: list[dict] = []
-        for det in detections:
-            code = det["data"]
-            if now - self._last_scan_time.get(code, 0.0) >= self.debounce_time:
-                self._last_scan_time[code] = now
-                passed.append(det)
-                self._record_history(det)
+        with self._lock:
+            self._prune_debounce_map(now)
+            passed: list[dict] = []
+            for det in detections:
+                code = det["data"]
+                if now - self._last_scan_time.get(code, 0.0) >= self._debounce_time:
+                    self._last_scan_time[code] = now
+                    passed.append(det)
+                    self._record_history(det)
         return passed
 
     def _record_history(self, det: dict) -> None:
@@ -276,15 +385,24 @@ class EnhancedBarcodeScanner:
         }
 
     def reset_history(self) -> None:
-        self._scan_history.clear()
-        self._last_scan_time.clear()
+        with self._lock:
+            self._scan_history.clear()
+            self._last_scan_time.clear()
+        self._cache.clear()
 
 
 # ── Session-state helpers ─────────────────────────────────────────────────────
 
+_scanner_init_lock = threading.Lock()
+
+
 def _get_scanner(key: str) -> EnhancedBarcodeScanner:
+    """Return (or lazily create) a per-session scanner instance."""
     if key not in st.session_state:
-        st.session_state[key] = EnhancedBarcodeScanner()
+        with _scanner_init_lock:
+            # Double-checked locking pattern
+            if key not in st.session_state:
+                st.session_state[key] = EnhancedBarcodeScanner()
     return st.session_state[key]
 
 
@@ -310,18 +428,24 @@ def _render_status_badge(scanner: EnhancedBarcodeScanner) -> None:
         )
 
 
+def _build_result(det: dict, source: str) -> dict:
+    """Build the result dict from a detection without any Streamlit side-effects."""
+    return {
+        "code": det["data"],
+        "source": source,
+        "confidence": det["confidence"],
+        "type": det["type"],
+        "details": det,
+    }
+
+
 def _render_detection(det: dict, source: str) -> dict:
+    """Render detection feedback UI and return the result dict."""
     conf = det["confidence"]
     emoji = "🟢" if conf > 0.85 else "🟡" if conf > 0.65 else "🔴"
     st.success(f"{emoji} **Detected:** `{det['data']}`")
     st.caption(f"Type: {det['type']} · Confidence: {conf:.0%} · Source: {source}")
-    return {
-        "code": det["data"],
-        "source": source,
-        "confidence": conf,
-        "type": det["type"],
-        "details": det,
-    }
+    return _build_result(det, source)
 
 
 # ── Main interface ────────────────────────────────────────────────────────────
@@ -339,16 +463,19 @@ def create_enhanced_scanner_interface(
     """
     scanner_key = f"_scanner_{key_prefix}"
     scanner: EnhancedBarcodeScanner = _get_scanner(scanner_key)
-    # Apply any externally changed settings
-    scanner.debounce_time = debounce_time
-    scanner.confidence_threshold = confidence_threshold
+
+    # Apply externally changed settings via validated setters
+    try:
+        scanner.debounce_time = debounce_time
+        scanner.confidence_threshold = confidence_threshold
+    except ValueError as exc:
+        st.error(f"Invalid scanner setting: {exc}")
 
     st.markdown("### 📱 Product Scanner")
 
     if show_advanced:
         _render_status_badge(scanner)
 
-    # ── Guide banner ──────────────────────────────────────────────────────────
     st.markdown(
         """
         <div style="
@@ -406,7 +533,7 @@ def create_enhanced_scanner_interface(
             st.warning("Image scanning unavailable. Use **Manual Entry** tab.")
         else:
             uploaded = st.file_uploader(
-                "Upload barcode image",
+                f"Upload barcode image (max {_MAX_IMAGE_BYTES // 1_048_576} MB)",
                 type=["png", "jpg", "jpeg", "webp", "bmp"],
                 key=f"{key_prefix}_upload",
             )
@@ -449,6 +576,7 @@ def create_enhanced_scanner_interface(
             manual_code = st.text_input(
                 "Enter barcode",
                 placeholder="Type, paste, or use a keyboard wedge scanner…",
+                max_chars=_MAX_CODE_LEN,
                 key=f"{key_prefix}_manual",
             )
 
@@ -456,7 +584,6 @@ def create_enhanced_scanner_interface(
             st.markdown("<br>", unsafe_allow_html=True)
             submit = st.button("✓ Submit", key=f"{key_prefix}_manual_submit")
 
-        # Only fire on explicit submit to avoid per-keystroke validation
         if submit:
             code = manual_code.strip()
             if not code:
@@ -468,7 +595,8 @@ def create_enhanced_scanner_interface(
                     result = _render_detection(validation, "manual")
                 else:
                     st.error(
-                        f"Invalid barcode: `{code}` — must be ≥{_MIN_CODE_LEN} characters "
+                        f"Invalid barcode: `{code[:64]}{'…' if len(code) > 64 else ''}` "
+                        f"— must be {_MIN_CODE_LEN}–{_MAX_CODE_LEN} characters "
                         "and match a recognised format."
                     )
 
